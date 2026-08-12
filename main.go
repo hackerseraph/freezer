@@ -1397,11 +1397,22 @@ func onReady() {
 func onExit() {}
 
 func main() {
+	// Write logs to a file so startup errors are always visible on Windows
+	logDir, _ := os.UserCacheDir()
+	logPath := filepath.Join(logDir, "freezer", "freezer.log")
+	os.MkdirAll(filepath.Dir(logPath), 0755)
+	if logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+		log.SetOutput(io.MultiWriter(os.Stderr, logFile))
+		defer logFile.Close()
+	}
+	log.Printf("Freezer starting (os=%s)", runtime.GOOS)
+
 	appConfig = loadConfig()
 	if settingsMode {
+		log.Println("Opening settings window")
 		runSettingsWindow()
 		return
 	}
-	fmt.Printf("Freezer tray app starting in %s\n", appConfig.Root)
+	log.Printf("Tray app starting in %s", appConfig.Root)
 	systray.Run(onReady, onExit)
 }

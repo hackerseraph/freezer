@@ -25,16 +25,28 @@ func TestPlaceholderHandling(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := archiveLocalFile(path); err != nil {
+	rec := Record{
+		LocalPath:  path,
+		RemotePath: "/remote/example.txt",
+		ExpiresAt:  time.Now().Add(retentionDays * 24 * time.Hour),
+	}
+	if err := archiveLocalFile(path, rec); err != nil {
 		t.Fatal(err)
 	}
 
-	info, err := os.Stat(path)
+	// Original file should be gone
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("expected original file to be removed after archiving")
+	}
+
+	// .frozen stub should exist and contain content
+	frozenPath := path + ".frozen"
+	info, err := os.Stat(frozenPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size() != 0 {
-		t.Fatalf("expected placeholder to be empty, got size %d", info.Size())
+	if info.Size() == 0 {
+		t.Fatal("expected .frozen stub to have content, got empty file")
 	}
 }
 

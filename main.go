@@ -38,6 +38,7 @@ const metadataDirName = ".coldstorage"
 
 var appConfig Config
 var settingsMode bool
+var restorePath string
 
 // Config holds runtime settings for the tray app.
 type Config struct {
@@ -143,6 +144,7 @@ func loadConfig() Config {
 	}
 
 	flag.BoolVar(&settingsMode, "settings", false, "open the settings window")
+	flag.StringVar(&restorePath, "restore", "", "restore a single .frozen file by path")
 	flag.StringVar(&cfg.Root, "root", cfg.Root, "Local folder to sync")
 	flag.StringVar(&cfg.Host, "host", cfg.Host, "FTP host")
 	flag.StringVar(&cfg.User, "user", cfg.User, "FTP username")
@@ -316,20 +318,26 @@ func ensureRemoteDir(client *ftp.ServerConn, dir string) error {
 	return nil
 }
 
-func createPlaceholder(path string) error {
-	file, err := os.Create(path)
+func createPlaceholder(path string, rec Record) error {
+	frozenPath := path + ".frozen"
+	f, err := os.Create(frozenPath)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	return nil
+	defer f.Close()
+	archivedDate := rec.ExpiresAt.Add(-retentionDays * 24 * time.Hour).Format("2006-01-02")
+	_, err = fmt.Fprintf(f,
+		"[Freezer Archive]\nThis file has been moved to cold storage.\nOriginal: %s\nArchived: %s\nRemote: %s\n\nDouble-click this file to restore it, or use the Freezer tray menu.\n",
+		filepath.Base(path), archivedDate, rec.RemotePath,
+	)
+	return err
 }
 
-func archiveLocalFile(path string) error {
+func archiveLocalFile(path string, rec Record) error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	return createPlaceholder(path)
+	return createPlaceholder(path, rec)
 }
 
 func restoreFile(client *ftp.ServerConn, localPath string, rec Record) error {
@@ -352,6 +360,9 @@ func restoreFile(client *ftp.ServerConn, localPath string, rec Record) error {
 	if _, err := io.Copy(out, resp); err != nil {
 		return err
 	}
+
+	// Remove the .frozen stub now that content is restored
+	os.Remove(localPath + ".frozen")
 	return nil
 }
 
@@ -375,6 +386,10 @@ func syncFolder(root string, client *ftp.ServerConn, state *State) error {
 			return nil
 		}
 		if filepath.Base(path) == metadataDirName {
+			return nil
+		}
+		// Skip .frozen placeholder stubs — they are not real file content
+		if strings.HasSuffix(path, ".frozen") {
 			return nil
 		}
 
@@ -419,7 +434,7 @@ func pruneExpired(client *ftp.ServerConn, state *State) error {
 				log.Printf("skip prune for %s: remote file missing - %v", localPath, err)
 				continue
 			}
-			if err := archiveLocalFile(localPath); err != nil {
+			if err := archiveLocalFile(localPath, record); err != nil {
 				return err
 			}
 			record.Placeholder = true
@@ -445,6 +460,108 @@ func restorePlaceholderIfNeeded(path string, client *ftp.ServerConn, state *Stat
 	record.UploadedAt = time.Now()
 	record.ExpiresAt = time.Now().Add(retentionDays * 24 * time.Hour)
 	state.Records[path] = record
+	return nil
+}
+
+// restoreSingleFile restores one .frozen placeholder back to its original content.
+// Called when the user double-clicks a .frozen file via shell integration.
+func restoreSingleFile(frozenPath string) error {
+	originalPath := strings.TrimSuffix(frozenPath, ".frozen")
+
+	metadataPath := filepath.Join(appConfig.Root, metadataDirName, "index.json")
+	state := newState()
+	if err := state.Load(metadataPath); err != nil {
+		return fmt.Errorf("cannot load state: %w", err)
+	}
+
+	record, ok := state.Records[originalPath]
+	if !ok || !record.Placeholder {
+		return fmt.Errorf("no archive record found for %s", originalPath)
+	}
+
+	client, err := connectFTP(appConfig.Host, appConfig.User, appConfig.Pass)
+	if err != nil {
+		return err
+	}
+	defer client.Quit()
+
+	if err := restoreFile(client, originalPath, record); err != nil {
+		return err
+	}
+
+	record.Placeholder = false
+	record.UploadedAt = time.Now()
+	record.ExpiresAt = time.Now().Add(retentionDays * 24 * time.Hour)
+	state.Records[originalPath] = record
+	return state.Save(metadataPath)
+}
+
+// installShellIntegration registers .frozen files with the OS so double-clicking restores them.
+func installShellIntegration() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exePath, _ = filepath.EvalSymlinks(exePath)
+
+	if runtime.GOOS == "windows" {
+		return installShellIntegrationWindows(exePath)
+	}
+	return installShellIntegrationLinux(exePath)
+}
+
+func installShellIntegrationWindows(exePath string) error {
+	openCmd := `"` + exePath + `" -restore "%1"`
+	cmds := [][]string{
+		{"reg", "add", `HKCU\Software\Classes\.frozen`, "/ve", "/d", "FreezerPlaceholder", "/f"},
+		{"reg", "add", `HKCU\Software\Classes\FreezerPlaceholder`, "/ve", "/d", "Freezer Archive File", "/f"},
+		{"reg", "add", `HKCU\Software\Classes\FreezerPlaceholder\DefaultIcon`, "/ve", "/d", exePath + ",0", "/f"},
+		{"reg", "add", `HKCU\Software\Classes\FreezerPlaceholder\shell\open\command`, "/ve", "/d", openCmd, "/f"},
+	}
+	for _, args := range cmds {
+		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+			return fmt.Errorf("reg command failed: %v: %s", err, out)
+		}
+	}
+	return nil
+}
+
+func installShellIntegrationLinux(exePath string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	// Register MIME type
+	mimeDir := filepath.Join(home, ".local", "share", "mime", "packages")
+	if err := os.MkdirAll(mimeDir, 0755); err != nil {
+		return err
+	}
+	mimeXML := `<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-freezer-placeholder">
+    <comment>Freezer Archive Placeholder</comment>
+    <glob pattern="*.frozen"/>
+  </mime-type>
+</mime-info>`
+	if err := os.WriteFile(filepath.Join(mimeDir, "freezer.xml"), []byte(mimeXML), 0644); err != nil {
+		return err
+	}
+
+	// Register .desktop handler
+	appDir := filepath.Join(home, ".local", "share", "applications")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		return err
+	}
+	desktop := fmt.Sprintf("[Desktop Entry]\nName=Freezer Restore\nExec=%s -restore %%f\nType=Application\nMimeType=application/x-freezer-placeholder;\nNoDisplay=true\n", exePath)
+	if err := os.WriteFile(filepath.Join(appDir, "freezer-restore.desktop"), []byte(desktop), 0644); err != nil {
+		return err
+	}
+
+	// Update system databases (errors are non-fatal)
+	exec.Command("update-mime-database", filepath.Join(home, ".local", "share", "mime")).Run()
+	exec.Command("update-desktop-database", appDir).Run()
+	exec.Command("xdg-mime", "default", "freezer-restore.desktop", "application/x-freezer-placeholder").Run()
 	return nil
 }
 
@@ -1171,13 +1288,29 @@ func runSettingsWindow() {
 		excludeScroll,
 	)
 
+	shellIntegrationStatus := widget.NewLabel("")
+	installShellBtn := widget.NewButton("Install shell integration", func() {
+		if err := installShellIntegration(); err != nil {
+			shellIntegrationStatus.SetText("Failed: " + err.Error())
+		} else {
+			shellIntegrationStatus.SetText("✓ Installed! Double-click any .frozen file to restore it.")
+		}
+	})
+	systemPanel := container.NewVBox(
+		widget.NewLabelWithStyle("System Integration", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel("Register .frozen files with the OS so double-clicking restores them."),
+		container.NewHBox(installShellBtn),
+		container.NewPadded(shellIntegrationStatus),
+	)
+
 	sections := map[string]fyne.CanvasObject{
 		"Power":         powerPanel,
 		"Sync Schedule": schedulePanel,
 		"FTP & Folder":  ftpPanel,
 		"Exclusions":    exclusionsPanel,
+		"System":        systemPanel,
 	}
-	order := []string{"Power", "Sync Schedule", "FTP & Folder", "Exclusions"}
+	order := []string{"Power", "Sync Schedule", "FTP & Folder", "Exclusions", "System"}
 	selectedSection := "Power"
 	rightPanel := container.NewVBox(sections[selectedSection])
 
@@ -1456,6 +1589,15 @@ func main() {
 	log.Printf("Freezer starting (os=%s)", runtime.GOOS)
 
 	appConfig = loadConfig()
+	if restorePath != "" {
+		log.Printf("Restoring single file: %s", restorePath)
+		if err := restoreSingleFile(restorePath); err != nil {
+			log.Printf("restore failed: %v", err)
+			os.Exit(1)
+		}
+		log.Printf("Restored successfully")
+		return
+	}
 	if settingsMode {
 		log.Println("Opening settings window")
 		runSettingsWindow()

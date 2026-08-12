@@ -612,17 +612,60 @@ func makeTrayIconData() []byte {
 	return buf.Bytes()
 }
 
+func makeTrayIconICO() []byte {
+	pngData := makeTrayIconData()
+	if len(pngData) == 0 {
+		return nil
+	}
+
+	// Wrap PNG bytes in an ICO container.
+	// Windows Vista+ supports PNG images embedded directly in ICO files.
+	dataSize := uint32(len(pngData))
+	dataOffset := uint32(6 + 16) // ICONDIR (6 bytes) + one ICONDIRENTRY (16 bytes)
+
+	var buf bytes.Buffer
+
+	// ICONDIR header (6 bytes)
+	buf.Write([]byte{0, 0})  // idReserved
+	buf.Write([]byte{1, 0})  // idType = 1 (ICO)
+	buf.Write([]byte{1, 0})  // idCount = 1
+
+	// ICONDIRENTRY (16 bytes)
+	buf.WriteByte(64)         // bWidth
+	buf.WriteByte(64)         // bHeight
+	buf.WriteByte(0)          // bColorCount (0 = PNG)
+	buf.WriteByte(0)          // bReserved
+	buf.Write([]byte{1, 0})  // wPlanes
+	buf.Write([]byte{32, 0}) // wBitCount
+	buf.Write([]byte{       // dwBytesInRes
+		byte(dataSize), byte(dataSize >> 8),
+		byte(dataSize >> 16), byte(dataSize >> 24),
+	})
+	buf.Write([]byte{       // dwImageOffset
+		byte(dataOffset), byte(dataOffset >> 8),
+		byte(dataOffset >> 16), byte(dataOffset >> 24),
+	})
+
+	buf.Write(pngData)
+	return buf.Bytes()
+}
+
 func setTrayIcon() {
-	icon := makeTrayIconData()
-	if len(icon) == 0 {
-		systray.SetTitle("")
-		systray.SetTooltip("Freezer sync")
+	systray.SetTooltip("Freezer sync")
+	systray.SetTitle("")
+
+	var iconData []byte
+	if runtime.GOOS == "windows" {
+		iconData = makeTrayIconICO()
+	} else {
+		iconData = makeTrayIconData()
+	}
+
+	if len(iconData) == 0 {
 		return
 	}
-	systray.SetIcon(icon)
-	systray.SetTemplateIcon(icon, icon)
-	systray.SetTitle("")
-	systray.SetTooltip("Freezer sync")
+	systray.SetIcon(iconData)
+	systray.SetTemplateIcon(iconData, iconData)
 }
 
 type compactTheme struct {

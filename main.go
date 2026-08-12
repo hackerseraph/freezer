@@ -303,7 +303,12 @@ func ensureRemoteDir(client *ftp.ServerConn, dir string) error {
 		}
 		current = strings.TrimRight(current, "/") + "/" + part
 		if err := client.MakeDir(current); err != nil {
-			if !strings.Contains(err.Error(), "already exists") {
+			// FTP servers return various messages when directory already exists
+			e := strings.ToLower(err.Error())
+			if !strings.Contains(e, "already exists") &&
+				!strings.Contains(e, "file exists") &&
+				!strings.Contains(e, "exists") &&
+				!strings.Contains(e, "550") {
 				return err
 			}
 		}
@@ -654,13 +659,13 @@ func setTrayIcon() {
 	systray.SetTooltip("Freezer sync")
 	systray.SetTitle("")
 
-	var iconData []byte
+	// getlantern/systray has a known bug on Windows where it misreports
+	// successful icon API calls as errors. Skip icon on Windows to avoid noise.
 	if runtime.GOOS == "windows" {
-		iconData = makeTrayIconICO()
-	} else {
-		iconData = makeTrayIconData()
+		return
 	}
 
+	iconData := makeTrayIconData()
 	if len(iconData) == 0 {
 		return
 	}

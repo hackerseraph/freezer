@@ -110,6 +110,13 @@ go test ./...
 - Certificate-based auth: WireGuard-style keypair authentication for FTP sessions, eliminating plaintext username/password credentials in settings
 - Virus scanning: integrate ClamAV to scan files on restore before writing them back to disk, blocking any malware that may have been uploaded by another client
 
+### Storage Backends
+- External drives: archive to a locally attached USB or eSATA drive instead of a network server, with automatic detection when the drive is connected and graceful handling when it is not
+- FTP: current default backend (already implemented)
+- NFS shares: mount and write directly to NFS exports, suitable for home lab NAS devices and Linux servers
+- CIFS/SMB shares: support Windows file shares and Samba, covering NAS appliances and Windows Server environments
+- Pluggable backend interface: common abstraction layer so additional backends can be added without changes to the core sync logic
+
 ### Scheduling
 - Flexible schedules: cron-style scheduling beyond the current nightly fixed time, with per-folder schedule overrides
 - Nightly cleanup routine: detect and resolve interrupted freeze operations left in a partial state (original file deleted but .frozen stub missing, or stub present with no state record) and reconcile them against the FTP server automatically

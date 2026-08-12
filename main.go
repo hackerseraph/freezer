@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,16 +41,18 @@ var settingsMode bool
 
 // Config holds runtime settings for the tray app.
 type Config struct {
-	Root          string
-	Host          string
-	User          string
-	Pass          string
-	FTPRoot       string
-	SyncOnBattery bool
-	Weekdays      [7]bool
-	SyncHour      int
-	SyncMinute    int
-	Interval      time.Duration
+	Root                   string
+	Host                   string
+	User                   string
+	Pass                   string
+	FTPRoot                string
+	SyncOnBattery          bool
+	PreventSleepDuringSync bool
+	ExcludedFolders        []string
+	Weekdays               [7]bool
+	SyncHour               int
+	SyncMinute             int
+	Interval               time.Duration
 }
 
 // Record tracks a file's lifecycle in local cold storage.
@@ -79,16 +82,18 @@ func newState() *State {
 
 func defaultConfig() Config {
 	return Config{
-		Root:          ".",
-		Host:          "",
-		User:          "",
-		Pass:          "",
-		FTPRoot:       "/",
-		SyncOnBattery: false,
-		Weekdays:      [7]bool{},
-		SyncHour:      23,
-		SyncMinute:    0,
-		Interval:      5 * time.Minute,
+		Root:                   ".",
+		Host:                   "",
+		User:                   "",
+		Pass:                   "",
+		FTPRoot:                "/",
+		SyncOnBattery:          false,
+		PreventSleepDuringSync: false,
+		ExcludedFolders:        []string{},
+		Weekdays:               [7]bool{},
+		SyncHour:               23,
+		SyncMinute:             0,
+		Interval:               5 * time.Minute,
 	}
 }
 
@@ -144,6 +149,7 @@ func loadConfig() Config {
 	flag.StringVar(&cfg.Pass, "pass", cfg.Pass, "FTP password")
 	flag.StringVar(&cfg.FTPRoot, "ftp-root", cfg.FTPRoot, "FTP root folder")
 	flag.BoolVar(&cfg.SyncOnBattery, "sync-on-battery", cfg.SyncOnBattery, "Allow sync while on battery")
+	flag.BoolVar(&cfg.PreventSleepDuringSync, "prevent-sleep", cfg.PreventSleepDuringSync, "Prevent machine sleep during sync")
 	flag.DurationVar(&cfg.Interval, "interval", cfg.Interval, "Sync interval")
 	flag.Parse()
 
@@ -165,6 +171,11 @@ func loadConfig() Config {
 	if v := os.Getenv("COLDSTORE_SYNC_ON_BATTERY"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.SyncOnBattery = b
+		}
+	}
+	if v := os.Getenv("COLDSTORE_PREVENT_SLEEP"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.PreventSleepDuringSync = b
 		}
 	}
 	if v := os.Getenv("COLDSTORE_INTERVAL"); v != "" {
@@ -348,6 +359,14 @@ func syncFolder(root string, client *ftp.ServerConn, state *State) error {
 			if filepath.Base(path) == metadataDirName {
 				return filepath.SkipDir
 			}
+			// Skip excluded folders (matched by relative path from root)
+			if rel, relErr := filepath.Rel(root, path); relErr == nil && rel != "." {
+				for _, ex := range appConfig.ExcludedFolders {
+					if rel == ex || strings.HasPrefix(rel, ex+string(filepath.Separator)) {
+						return filepath.SkipDir
+					}
+				}
+			}
 			return nil
 		}
 		if filepath.Base(path) == metadataDirName {
@@ -424,7 +443,52 @@ func restorePlaceholderIfNeeded(path string, client *ftp.ServerConn, state *Stat
 	return nil
 }
 
+// preventSleep starts an inhibitor process to prevent machine sleep
+// Returns a cleanup function to stop the inhibitor
+func preventSleep() func() {
+	var cmd *exec.Cmd
+	
+	if runtime.GOOS == "windows" {
+		// Windows: Use PowerShell to prevent sleep via Windows API
+		psScript := `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public class WindowsAPI {
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern void SetThreadExecutionState(uint esFlags);
+}
+"@
+
+[WindowsAPI]::SetThreadExecutionState(0x80000003)
+Start-Sleep -Seconds 999999
+`
+		cmd = exec.Command("powershell", "-NoProfile", "-Command", psScript)
+	} else {
+		// Linux/macOS: Use systemd-inhibit
+		cmd = exec.Command("systemd-inhibit", "--why=Freezer sync in progress", "--mode=block", "sleep", "infinity")
+	}
+	
+	if err := cmd.Start(); err != nil {
+		// Command not available, silently fail
+		return func() {}
+	}
+	
+	return func() {
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+	}
+}
+
 func runColdStorage(root, host, user, pass string) error {
+	var cleanup func()
+	if appConfig.PreventSleepDuringSync {
+		cleanup = preventSleep()
+		defer cleanup()
+	}
+	
 	metadataPath := filepath.Join(root, metadataDirName, "index.json")
 	state := newState()
 	if err := state.Load(metadataPath); err != nil {
@@ -598,27 +662,102 @@ func refreshConfig() {
 	appConfig = cfg
 }
 
+func getCommonFolders() map[string]string {
+	folders := make(map[string]string)
+	
+	if home, err := os.UserHomeDir(); err == nil {
+		folders["Home"] = home
+	}
+	if desktop, err := os.UserHomeDir(); err == nil {
+		folders["Desktop"] = filepath.Join(desktop, "Desktop")
+	}
+	if docs, err := os.UserHomeDir(); err == nil {
+		folders["Documents"] = filepath.Join(docs, "Documents")
+	}
+	if downloads, err := os.UserHomeDir(); err == nil {
+		folders["Downloads"] = filepath.Join(downloads, "Downloads")
+	}
+	
+	return folders
+}
+
 func chooseLocalFolder(parent fyne.Window, currentPath string, onSelect func(string)) {
 	a := fyne.CurrentApp()
 	if a == nil {
 		return
 	}
 
-	picker := a.NewWindow("Select local folder")
-	picker.Resize(fyne.NewSize(760, 500))
+	picker := a.NewWindow("Select Folder")
+	picker.Resize(fyne.NewSize(900, 600))
 	picker.SetFixedSize(false)
 	picker.SetCloseIntercept(func() {
 		picker.Close()
 	})
 
-	pathEntry := widget.NewEntry()
-	pathEntry.SetText(currentPath)
-	pathEntry.SetPlaceHolder("Type or paste a folder path")
-	rootBox := container.NewVBox()
 	var currentFolder string
-	var renderFolderList func(string)
+	if currentPath == "" {
+		currentPath = "."
+	}
+	absFolder, err := filepath.Abs(currentPath)
+	if err == nil {
+		currentFolder = absFolder
+	} else {
+		currentFolder = currentPath
+	}
 
-	renderFolderList = func(folder string) {
+	// Navigation history for back/forward
+	history := []string{currentFolder}
+	historyIndex := 0
+
+	// UI elements
+	folderDisplay := container.NewVBox()
+	scrollContainer := container.NewScroll(folderDisplay)
+	pathEntry := widget.NewEntry()
+	pathEntry.SetPlaceHolder("Enter folder path...")
+
+	var refreshFolder func(string)
+	var updatePathDisplay func()
+
+	// Create breadcrumb navigation
+	breadcrumbContainer := container.NewHBox()
+	updateBreadcrumb := func() {
+		breadcrumbContainer.Objects = []fyne.CanvasObject{}
+		parts := strings.Split(strings.TrimPrefix(currentFolder, "/"), "/")
+		if currentFolder == "/" {
+			parts = []string{""}
+		}
+		
+		path := ""
+		for i, part := range parts {
+			if part == "" && i == 0 {
+				p := "/"
+				btn := widget.NewButton(p, func(targetPath string) func() {
+					return func() { refreshFolder(targetPath) }
+				}("/"))
+				btn.Importance = widget.LowImportance
+				breadcrumbContainer.Add(btn)
+			} else if part != "" {
+				path = filepath.Join(path, part)
+				btnLabel := part
+				if i < len(parts)-1 {
+					btnLabel = part + " >"
+				}
+				btn := widget.NewButton(btnLabel, func(targetPath string) func() {
+					return func() { refreshFolder(targetPath) }
+				}(path))
+				btn.Importance = widget.LowImportance
+				breadcrumbContainer.Add(btn)
+			}
+		}
+	}
+
+	updatePathDisplay = func() {
+		pathEntry.SetText(currentFolder)
+		updateBreadcrumb()
+		breadcrumbContainer.Refresh()
+	}
+
+	refreshFolder = func(folder string) {
 		currentFolder = folder
 		if currentFolder == "" {
 			currentFolder = "."
@@ -627,18 +766,78 @@ func chooseLocalFolder(parent fyne.Window, currentPath string, onSelect func(str
 		if err == nil {
 			currentFolder = absFolder
 		}
-		pathEntry.SetText(currentFolder)
 
-		items := []fyne.CanvasObject{}
-		if parentDir := filepath.Dir(currentFolder); parentDir != currentFolder {
-			items = append(items, widget.NewButton(".. (parent folder)", func() {
-				renderFolderList(parentDir)
-			}))
+		// Update history
+		if historyIndex < len(history)-1 {
+			history = history[:historyIndex+1]
 		}
+		if len(history) == 0 || history[len(history)-1] != currentFolder {
+			history = append(history, currentFolder)
+			historyIndex = len(history) - 1
+		}
+
+		updatePathDisplay()
+
+		// Refresh folder contents
+		folderDisplay.Objects = []fyne.CanvasObject{}
 		entries, err := os.ReadDir(currentFolder)
 		if err != nil {
-			items = append(items, widget.NewLabel("Unable to read folder"))
+			folderDisplay.Add(widget.NewLabel("Unable to read folder"))
 		} else {
+			var dirs []string
+			for _, entry := range entries {
+				if entry.IsDir() {
+					dirs = append(dirs, entry.Name())
+				}
+			}
+			sort.Strings(dirs)
+
+			if len(dirs) == 0 {
+				folderDisplay.Add(widget.NewLabel("No subfolders"))
+			} else {
+				for _, name := range dirs {
+					if name == metadataDirName {
+						continue
+					}
+					if strings.HasPrefix(name, ".") {
+						continue
+					}
+					fullPath := filepath.Join(currentFolder, name)
+					folderName := name
+					btn := widget.NewButton("📁 " + folderName, func(path string) func() {
+						return func() { refreshFolder(path) }
+					}(fullPath))
+					folderDisplay.Add(btn)
+				}
+			}
+		}
+		folderDisplay.Refresh()
+		scrollContainer.Refresh()
+	}
+
+	// Sidebar with quick access locations
+	sidebar := container.NewVBox(
+		widget.NewLabelWithStyle("Quick Access", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+	)
+	commonFolders := getCommonFolders()
+	for name, path := range map[string]string{"Home": commonFolders["Home"], "Desktop": commonFolders["Desktop"], "Documents": commonFolders["Documents"], "Downloads": commonFolders["Downloads"]} {
+		if path != "" {
+			btn := widget.NewButton(name, func(p string) func() {
+				return func() { refreshFolder(p) }
+			}(path))
+			btn.Importance = widget.LowImportance
+			sidebar.Add(btn)
+		}
+	}
+
+	// Navigation toolbar
+	backBtn := widget.NewButton("← Back", func() {
+		if historyIndex > 0 {
+			historyIndex--
+			currentFolder = history[historyIndex]
+			updatePathDisplay()
+			folderDisplay.Objects = []fyne.CanvasObject{}
+			entries, _ := os.ReadDir(currentFolder)
 			var dirs []string
 			for _, entry := range entries {
 				if entry.IsDir() {
@@ -651,29 +850,64 @@ func chooseLocalFolder(parent fyne.Window, currentPath string, onSelect func(str
 					continue
 				}
 				fullPath := filepath.Join(currentFolder, name)
-				items = append(items, widget.NewButton(name, func(path string) func() {
-					return func() { renderFolderList(path) }
-				}(fullPath)))
+				btn := widget.NewButton("📁 " + name, func(path string) func() {
+					return func() { refreshFolder(path) }
+				}(fullPath))
+				folderDisplay.Add(btn)
 			}
-			if len(dirs) == 0 {
-				items = append(items, widget.NewLabel("No subfolders"))
-			}
-		}
-		rootBox.Objects = items
-		rootBox.Refresh()
-	}
-
-	if currentPath == "" {
-		currentPath = "."
-	}
-	renderFolderList(currentPath)
-
-	openHome := widget.NewButton("Home", func() {
-		if home, err := os.UserHomeDir(); err == nil {
-			renderFolderList(home)
+			folderDisplay.Refresh()
+			scrollContainer.Refresh()
 		}
 	})
-	selectButton := widget.NewButton("Use this folder", func() {
+	forwardBtn := widget.NewButton("Forward →", func() {
+		if historyIndex < len(history)-1 {
+			historyIndex++
+			currentFolder = history[historyIndex]
+			updatePathDisplay()
+			folderDisplay.Objects = []fyne.CanvasObject{}
+			entries, _ := os.ReadDir(currentFolder)
+			var dirs []string
+			for _, entry := range entries {
+				if entry.IsDir() {
+					dirs = append(dirs, entry.Name())
+				}
+			}
+			sort.Strings(dirs)
+			for _, name := range dirs {
+				if name == metadataDirName {
+					continue
+				}
+				fullPath := filepath.Join(currentFolder, name)
+				btn := widget.NewButton("📁 " + name, func(path string) func() {
+					return func() { refreshFolder(path) }
+				}(fullPath))
+				folderDisplay.Add(btn)
+			}
+			folderDisplay.Refresh()
+			scrollContainer.Refresh()
+		}
+	})
+	upBtn := widget.NewButton("⬆ Up", func() {
+		parent := filepath.Dir(currentFolder)
+		if parent != currentFolder {
+			refreshFolder(parent)
+		}
+	})
+	for _, b := range []*widget.Button{backBtn, forwardBtn, upBtn} {
+		b.Importance = widget.LowImportance
+	}
+
+	toolbar := container.NewHBox(backBtn, forwardBtn, upBtn, layout.NewSpacer())
+
+	// Path entry handler
+	pathEntry.OnSubmitted = func(text string) {
+		if text != "" {
+			refreshFolder(text)
+		}
+	}
+
+	// Bottom buttons
+	selectButton := widget.NewButton("Select Folder", func() {
 		picked := strings.TrimSpace(pathEntry.Text)
 		if picked == "" {
 			picked = currentFolder
@@ -681,38 +915,29 @@ func chooseLocalFolder(parent fyne.Window, currentPath string, onSelect func(str
 		onSelect(picked)
 		picker.Close()
 	})
+	selectButton.Importance = widget.HighImportance
 	cancelButton := widget.NewButton("Cancel", func() {
 		picker.Close()
 	})
-	pathEntry.OnSubmitted = func(text string) {
-		if text == "" {
-			return
-		}
-		renderFolderList(text)
-	}
-
-	pathLabel := widget.NewLabelWithStyle("Location", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-	pathField := container.NewBorder(nil, nil, nil, nil, pathEntry)
-	buttonRow := container.NewHBox(
+	bottomBar := container.NewHBox(
 		layout.NewSpacer(),
-		openHome,
 		selectButton,
 		cancelButton,
-		layout.NewSpacer(),
 	)
-	topBar := container.NewVBox(
-		container.NewPadded(pathLabel),
-		container.NewPadded(pathField),
-		container.NewPadded(buttonRow),
+
+	// Initial refresh
+	refreshFolder(currentFolder)
+
+	// Main layout: sidebar on left, main content on right
+	mainContent := container.NewBorder(
+		container.NewVBox(toolbar, pathEntry),
+		bottomBar,
+		sidebar,
+		nil,
+		scrollContainer,
 	)
-	content := container.NewBorder(
-		topBar,
-		nil,
-		nil,
-		nil,
-		container.NewPadded(container.NewScroll(rootBox)),
-	)
-	picker.SetContent(content)
+
+	picker.SetContent(mainContent)
 	picker.Show()
 }
 
@@ -745,6 +970,9 @@ func runSettingsWindow() {
 	batteryCheck := widget.NewCheck("Sync on battery", func(checked bool) {})
 	batteryCheck.Checked = appConfig.SyncOnBattery
 	batteryCheck.SetChecked(appConfig.SyncOnBattery)
+	preventSleepCheck := widget.NewCheck("Prevent sleep during sync", func(checked bool) {})
+	preventSleepCheck.Checked = appConfig.PreventSleepDuringSync
+	preventSleepCheck.SetChecked(appConfig.PreventSleepDuringSync)
 
 	browseButton := widget.NewButton("Browse", func() {
 		chooseLocalFolder(w, rootEntry.Text, func(path string) {
@@ -757,6 +985,7 @@ func runSettingsWindow() {
 		widget.NewLabelWithStyle("Power", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		widget.NewLabel("Machine-level power behavior."),
 		container.NewPadded(batteryCheck),
+		container.NewPadded(preventSleepCheck),
 	)
 
 	weekdayLabels := []string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
@@ -767,7 +996,18 @@ func runSettingsWindow() {
 		weekdayChecks[i].SetChecked(appConfig.Weekdays[i])
 	}
 	throughputStatus := widget.NewLabel("No throughput test run yet.")
-	throughputButton := widget.NewButton("Test throughput", func() {
+	throughputProgress := widget.NewProgressBarInfinite()
+	throughputProgress.Hide() // Hidden by default
+	
+	// Container to hold status and progress spinner
+	throughputContainer := container.NewVBox(
+		throughputStatus,
+		throughputProgress,
+	)
+	
+	throughputButton := widget.NewButton("Test throughput", nil)
+	
+	throughputButton.OnTapped = func() {
 		if appConfig.Host == "" || strings.Contains(appConfig.Host, "example.com") {
 			dialog.NewError(fmt.Errorf("enter a real FTP server before testing throughput"), w).Show()
 			return
@@ -776,16 +1016,29 @@ func runSettingsWindow() {
 			dialog.NewError(fmt.Errorf("FTP username is required"), w).Show()
 			return
 		}
+		
+		// Show progress spinner and disable button
+		throughputButton.Disable()
 		throughputStatus.SetText("Testing FTP throughput...")
+		throughputProgress.Show()
+		
+		// Run test in goroutine so UI can render the progress spinner
 		go func() {
 			uploadMbps, downloadMbps, err := measureFTPThroughput(appConfig.Host, appConfig.User, appConfig.Pass, appConfig.FTPRoot)
+			
+			// Hide progress spinner
+			throughputProgress.Hide()
+			
 			if err != nil {
 				throughputStatus.SetText(fmt.Sprintf("Throughput test failed: %v", err))
-				return
+			} else {
+				throughputStatus.SetText(fmt.Sprintf("Upload: %.2f Mb/s  |  Download: %.2f Mb/s", uploadMbps, downloadMbps))
 			}
-			throughputStatus.SetText(fmt.Sprintf("Upload: %.2f Mb/s  |  Download: %.2f Mb/s", uploadMbps, downloadMbps))
+			
+			// Re-enable button
+			throughputButton.Enable()
 		}()
-	})
+	}
 	schedulePanel := container.NewVBox(
 		widget.NewLabelWithStyle("Sync Schedule", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		widget.NewLabel("Syncs start nightly at 11:00 PM."),
@@ -800,7 +1053,7 @@ func runSettingsWindow() {
 			weekdayChecks[6],
 		),
 		container.NewHBox(throughputButton),
-		container.NewPadded(throughputStatus),
+		container.NewPadded(throughputContainer),
 	)
 
 	ftpPanel := container.NewVBox(
@@ -816,12 +1069,67 @@ func runSettingsWindow() {
 		ftpRootEntry,
 	)
 
+	// Exclusions panel
+	excludedSet := make(map[string]bool)
+	for _, ex := range appConfig.ExcludedFolders {
+		excludedSet[ex] = true
+	}
+	var excludeCheckboxes []*widget.Check
+	excludeList := container.NewVBox()
+	excludeScroll := container.NewScroll(excludeList)
+	excludeScroll.SetMinSize(fyne.NewSize(0, 220))
+
+	var refreshExcludeList func(root string)
+	refreshExcludeList = func(root string) {
+		excludeList.Objects = nil
+		excludeCheckboxes = nil
+		if root == "" {
+			excludeList.Add(widget.NewLabel("Select a root folder in FTP & Folder first."))
+			excludeList.Refresh()
+			return
+		}
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			excludeList.Add(widget.NewLabel("Cannot read root folder."))
+			excludeList.Refresh()
+			return
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || entry.Name() == metadataDirName {
+				continue
+			}
+			name := entry.Name()
+			chk := widget.NewCheck(name, func(bool) {})
+			chk.SetChecked(excludedSet[name])
+			excludeCheckboxes = append(excludeCheckboxes, chk)
+			excludeList.Add(chk)
+		}
+		if len(excludeCheckboxes) == 0 {
+			excludeList.Add(widget.NewLabel("No subfolders found in root."))
+		}
+		excludeList.Refresh()
+		excludeScroll.Refresh()
+	}
+	refreshExcludeList(appConfig.Root)
+
+	// Re-populate exclusions list when root folder changes
+	rootEntry.OnChanged = func(text string) {
+		refreshExcludeList(strings.TrimSpace(text))
+	}
+
+	exclusionsPanel := container.NewVBox(
+		widget.NewLabelWithStyle("Excluded Folders", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel("Checked folders will be skipped during sync."),
+		excludeScroll,
+	)
+
 	sections := map[string]fyne.CanvasObject{
 		"Power":         powerPanel,
 		"Sync Schedule": schedulePanel,
 		"FTP & Folder":  ftpPanel,
+		"Exclusions":    exclusionsPanel,
 	}
-	order := []string{"Power", "Sync Schedule", "FTP & Folder"}
+	order := []string{"Power", "Sync Schedule", "FTP & Folder", "Exclusions"}
 	selectedSection := "Power"
 	rightPanel := container.NewVBox(sections[selectedSection])
 
@@ -838,9 +1146,11 @@ func runSettingsWindow() {
 			for _, s := range order {
 				if b, ok := sidebarButtons[s]; ok {
 					b.Importance = widget.LowImportance
+					b.Refresh()
 				}
 			}
 			btn.Importance = widget.HighImportance
+			btn.Refresh()
 			selectedSection = name
 			rightPanel.Objects = []fyne.CanvasObject{sections[name]}
 			rightPanel.Refresh()
@@ -856,6 +1166,14 @@ func runSettingsWindow() {
 		cfg.Pass = strings.TrimSpace(passwordEntry.Text)
 		cfg.FTPRoot = strings.TrimSpace(ftpRootEntry.Text)
 		cfg.SyncOnBattery = batteryCheck.Checked
+		cfg.PreventSleepDuringSync = preventSleepCheck.Checked
+		var excluded []string
+		for _, chk := range excludeCheckboxes {
+			if chk.Checked {
+				excluded = append(excluded, chk.Text)
+			}
+		}
+		cfg.ExcludedFolders = excluded
 		cfg.SyncHour = 23
 		cfg.SyncMinute = 0
 		for i, chk := range weekdayChecks {
@@ -943,22 +1261,24 @@ func isScheduledSyncWindow(now time.Time) bool {
 }
 
 func measureFTPThroughput(host, user, pass, ftpRoot string) (uploadMbps float64, downloadMbps float64, err error) {
-	client, err := connectFTP(host, user, pass)
+	// Use separate connections for upload and download to avoid FTP state issues
+	uploadClient, err := connectFTP(host, user, pass)
 	if err != nil {
 		return 0, 0, err
 	}
-	defer client.Quit()
+	defer uploadClient.Quit()
 
-	testName := ".freezer-throughput-test.bin"
+	testName := ".freezer-test.bin"
 	remotePath := remotePathFromLocal(testName, ftpRoot)
-	payload := bytes.Repeat([]byte("0123456789abcdef"), 32768)
+	
+	// Larger payload for accurate throughput testing (10MB)
+	// Small transfers are dominated by protocol overhead; 10MB gives stable measurements
+	payload := bytes.Repeat([]byte("X"), 10485760) // 10MB
 	payloadSize := len(payload)
-	if payloadSize == 0 {
-		return 0, 0, fmt.Errorf("empty payload")
-	}
 
+	// Upload test
 	uploadStart := time.Now()
-	if err := client.Stor(remotePath, bytes.NewReader(payload)); err != nil {
+	if err := uploadClient.Stor(remotePath, bytes.NewReader(payload)); err != nil {
 		return 0, 0, err
 	}
 	uploadElapsed := time.Since(uploadStart).Seconds()
@@ -967,25 +1287,34 @@ func measureFTPThroughput(host, user, pass, ftpRoot string) (uploadMbps float64,
 	}
 	uploadMbps = (float64(payloadSize) * 8 / 1000000) / uploadElapsed
 
+	// Give server time to sync the file
+	time.Sleep(100 * time.Millisecond)
+
+	// Create a fresh connection for download
+	downloadClient, err := connectFTP(host, user, pass)
+	if err != nil {
+		return uploadMbps, 0, err
+	}
+	defer downloadClient.Quit()
+
+	// Download test
 	downloadStart := time.Now()
-	resp, err := client.Retr(remotePath)
+	resp, err := downloadClient.Retr(remotePath)
 	if err != nil {
 		return uploadMbps, 0, err
 	}
 	defer resp.Close()
 
-	buf := make([]byte, 65536)
 	readBytes := 0
+	buf := make([]byte, 32768)
 	for {
-		readN, readErr := resp.Read(buf)
-		if readN > 0 {
-			readBytes += readN
-		}
-		if readErr == io.EOF {
+		n, err := resp.Read(buf)
+		readBytes += n
+		if err == io.EOF {
 			break
 		}
-		if readErr != nil {
-			return uploadMbps, 0, readErr
+		if err != nil {
+			return uploadMbps, 0, err
 		}
 	}
 	downloadElapsed := time.Since(downloadStart).Seconds()
@@ -993,7 +1322,10 @@ func measureFTPThroughput(host, user, pass, ftpRoot string) (uploadMbps float64,
 		downloadElapsed = 0.001
 	}
 	downloadMbps = (float64(readBytes) * 8 / 1000000) / downloadElapsed
-	_ = client.Delete(remotePath)
+
+	// Clean up with the download client before closing
+	downloadClient.Delete(remotePath)
+	
 	return uploadMbps, downloadMbps, nil
 }
 
@@ -1008,6 +1340,8 @@ func onReady() {
 	remoteStatusItem.Disable()
 	batteryStatusItem := systray.AddMenuItem("Sync on battery: "+strconv.FormatBool(appConfig.SyncOnBattery), "Whether background sync is allowed while on battery")
 	batteryStatusItem.Disable()
+	sleepStatusItem := systray.AddMenuItem("Prevent sleep during sync: "+strconv.FormatBool(appConfig.PreventSleepDuringSync), "Whether to prevent machine sleep during sync")
+	sleepStatusItem.Disable()
 	systray.AddSeparator()
 	settingsItem := systray.AddMenuItem("Settings...", "Edit FTP and local folder configuration")
 	syncItem := systray.AddMenuItem("Sync now", "Run an immediate sync")

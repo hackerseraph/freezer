@@ -1,6 +1,65 @@
 # freezer
 A small Go project for using external storage as cold storage. Centered around laptops and environments with fast but small local storage, this lets you automatically move uncommon files to cold storage, to keep a constant churn of free space on your local devices.
 
+## Installation
+
+### Debian / Ubuntu / Linux Mint
+
+Install build dependencies:
+
+```bash
+sudo apt update
+sudo apt install -y golang-go gcc \
+  libgl1-mesa-dev libwayland-dev libdbus-1-dev \
+  libasound2-dev libxxf86vm-dev libayatana-appindicator3-dev
+```
+
+Clone and build:
+
+```bash
+git clone https://github.com/hackerseraph/freezer.git
+cd freezer
+go build -o freezer .
+```
+
+Run:
+
+```bash
+./freezer
+```
+
+To open settings on first run:
+
+```bash
+./freezer -settings
+```
+
+### Windows 10 / 11
+
+Install Go from https://go.dev/dl/ and TDM-GCC from https://jmeubank.github.io/tdm-gcc/ (required for CGo). Restart your terminal after both installs so PATH updates take effect.
+
+Clone and build:
+
+```powershell
+git clone https://github.com/hackerseraph/freezer.git
+cd freezer
+go build -o freezer.exe .
+```
+
+Run:
+
+```powershell
+.\freezer.exe
+```
+
+To open settings on first run:
+
+```powershell
+.\freezer.exe -settings
+```
+
+The app runs as a system tray icon. Look for it in the notification area (bottom right, click the ^ arrow if it is not visible).
+
 ## Run
 go run .
 

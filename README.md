@@ -115,7 +115,13 @@ go test ./...
 - FTP: current default backend (already implemented)
 - NFS shares: mount and write directly to NFS exports, suitable for home lab NAS devices and Linux servers
 - CIFS/SMB shares: support Windows file shares and Samba, covering NAS appliances and Windows Server environments
+- Cloud storage: Google Drive, OneDrive, and Dropbox as archive targets via their respective APIs, selectable from the settings UI alongside FTP and local network options
 - Pluggable backend interface: common abstraction layer so additional backends can be added without changes to the core sync logic
+
+### Migration and Uninstall
+- Migrate tray menu item: move all archived content from the current backend to a new one (e.g. FTP to Google Drive) without losing state, rewriting remote paths in the index as transfers complete
+- Uninstall tray menu item: rewarm all frozen files back to local disk, remove all .frozen stubs and the .coldstorage metadata directory, deregister shell integration, and optionally delete archived content from the remote backend, leaving the system in a clean pre-Freezer state
+- Pre-uninstall disk space check: calculate total rewarm size before starting and warn the user if there is not enough local space, offering the date-range partial restore slider if needed
 
 ### Scheduling
 - Flexible schedules: cron-style scheduling beyond the current nightly fixed time, with per-folder schedule overrides

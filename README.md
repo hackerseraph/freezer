@@ -112,3 +112,4 @@ go test ./...
 
 ### Scheduling
 - Flexible schedules: cron-style scheduling beyond the current nightly fixed time, with per-folder schedule overrides
+- Nightly cleanup routine: detect and resolve interrupted freeze operations left in a partial state (original file deleted but .frozen stub missing, or stub present with no state record) and reconcile them against the FTP server automatically

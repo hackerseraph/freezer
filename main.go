@@ -33,6 +33,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 	"github.com/getlantern/systray"
 	"github.com/jlaffaye/ftp"
+	bbolt "go.etcd.io/bbolt"
 )
 
 const defaultRetentionDays = 60
@@ -66,6 +67,7 @@ type Config struct {
 	VerifyUploadHash       bool
 	HashCommand            string
 	AllowUnsafeFreeze      bool
+	LastIndexBackup        time.Time
 	Weekdays               [7]bool
 	SyncHour               int
 	SyncMinute             int
@@ -89,13 +91,133 @@ func (r Record) IsExpired(now time.Time) bool {
 	return now.After(r.ExpiresAt) || now.Equal(r.ExpiresAt)
 }
 
-// State stores metadata for all synced files.
+// State is a bbolt-backed index of all tracked files.
 type State struct {
-	Records map[string]Record `json:"records"`
+	db *bbolt.DB
 }
 
+var recordsBucket = []byte("records")
+
 func newState() *State {
-	return &State{Records: make(map[string]Record)}
+	return &State{}
+}
+
+// Open opens (or creates) the bbolt database at the given path.
+// If a legacy index.json exists at the same location, its records are migrated.
+func (s *State) Open(dbPath string) error {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		return err
+	}
+	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return fmt.Errorf("open state db: %w", err)
+	}
+	s.db = db
+
+	// Ensure the records bucket exists
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(recordsBucket)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	// Migrate from legacy index.json if present and DB is empty
+	jsonPath := strings.TrimSuffix(dbPath, ".db") + ".json"
+	if err := s.migrateFromJSON(jsonPath); err != nil {
+		log.Printf("warning: json migration failed: %v", err)
+	}
+	return nil
+}
+
+func (s *State) migrateFromJSON(jsonPath string) error {
+	data, err := os.ReadFile(jsonPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var legacy struct {
+		Records map[string]Record `json:"records"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	// Only migrate if DB is currently empty
+	count := 0
+	s.db.View(func(tx *bbolt.Tx) error {
+		count = tx.Bucket(recordsBucket).Stats().KeyN
+		return nil
+	})
+	if count > 0 {
+		return nil
+	}
+	for path, rec := range legacy.Records {
+		if err := s.Put(path, rec); err != nil {
+			return err
+		}
+	}
+	log.Printf("migrated %d records from index.json to index.db", len(legacy.Records))
+	// Rename the old file so it's not re-migrated
+	os.Rename(jsonPath, jsonPath+".migrated")
+	return nil
+}
+
+func (s *State) Close() error {
+	if s.db != nil {
+		return s.db.Close()
+	}
+	return nil
+}
+
+func (s *State) Get(path string) (Record, bool) {
+	var rec Record
+	found := false
+	s.db.View(func(tx *bbolt.Tx) error {
+		v := tx.Bucket(recordsBucket).Get([]byte(path))
+		if v == nil {
+			return nil
+		}
+		if err := json.Unmarshal(v, &rec); err == nil {
+			found = true
+		}
+		return nil
+	})
+	return rec, found
+}
+
+func (s *State) Put(path string, rec Record) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		v, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(recordsBucket).Put([]byte(path), v)
+	})
+}
+
+func (s *State) Delete(path string) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(recordsBucket).Delete([]byte(path))
+	})
+}
+
+func (s *State) ForEach(fn func(path string, rec Record) error) error {
+	return s.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(recordsBucket).ForEach(func(k, v []byte) error {
+			var rec Record
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return err
+			}
+			return fn(string(k), rec)
+		})
+	})
+}
+
+// DBPath returns the path for the bbolt index database.
+func dbPath(root string) string {
+	return filepath.Join(root, metadataDirName, "index.db")
 }
 
 func defaultConfig() Config {
@@ -214,41 +336,6 @@ func loadConfig() Config {
 		cfg.Root = defaultConfig().Root
 	}
 	return cfg
-}
-
-func (s *State) Save(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0644)
-}
-
-func (s *State) Load(path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			s.Records = make(map[string]Record)
-			return nil
-		}
-		return err
-	}
-	if len(data) == 0 {
-		s.Records = make(map[string]Record)
-		return nil
-	}
-	var loaded State
-	if err := json.Unmarshal(data, &loaded); err != nil {
-		return err
-	}
-	if loaded.Records == nil {
-		loaded.Records = make(map[string]Record)
-	}
-	s.Records = loaded.Records
-	return nil
 }
 
 func connectFTP(host, user, pass string) (*ftp.ServerConn, error) {
@@ -421,7 +508,7 @@ func syncFolder(root string, client *ftp.ServerConn, state *State) error {
 		}
 		remotePath := remotePathFromLocal(rel, appConfig.FTPRoot)
 
-		record, ok := state.Records[path]
+		record, ok := state.Get(path)
 		now := time.Now()
 		if !ok || record.Placeholder || record.LastModified.Before(info.ModTime()) || now.After(record.ExpiresAt) {
 			contentHash, err := hashFile(path)
@@ -431,7 +518,7 @@ func syncFolder(root string, client *ftp.ServerConn, state *State) error {
 			if err := uploadFile(client, path, remotePath); err != nil {
 				return err
 			}
-			state.Records[path] = Record{
+			if err := state.Put(path, Record{
 				LocalPath:    path,
 				RemotePath:   remotePath,
 				UploadedAt:   now,
@@ -440,6 +527,8 @@ func syncFolder(root string, client *ftp.ServerConn, state *State) error {
 				ContentHash:  contentHash,
 				LastModified: info.ModTime(),
 				FileSize:     info.Size(),
+			}); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -448,48 +537,44 @@ func syncFolder(root string, client *ftp.ServerConn, state *State) error {
 
 func pruneExpired(client *ftp.ServerConn, state *State) error {
 	now := time.Now()
-	for localPath, record := range state.Records {
+	return state.ForEach(func(localPath string, record Record) error {
 		if record.Placeholder {
-			continue
+			return nil
 		}
-		if record.IsExpired(now) {
-			// If neither size nor hash verification is enabled, only proceed if the
-			// user has explicitly opted in to unsafe freezing
-			noVerification := !appConfig.VerifyUploadSize && !appConfig.VerifyUploadHash
-			if noVerification && !appConfig.AllowUnsafeFreeze {
-				log.Printf("skip prune for %s: no integrity checks enabled and allow-unsafe-freeze is off", localPath)
-				continue
-			}
-			remoteSize, err := client.FileSize(record.RemotePath)
-			if err != nil {
-				log.Printf("skip prune for %s: remote file missing - %v", localPath, err)
-				continue
-			}
-			// Size verification: confirm remote matches what we uploaded
-			if appConfig.VerifyUploadSize && record.FileSize > 0 && remoteSize != record.FileSize {
-				log.Printf("skip prune for %s: size mismatch local=%d remote=%d", localPath, record.FileSize, remoteSize)
-				continue
-			}
-			// Hash verification: confirm remote hash matches stored hash
-			if appConfig.VerifyUploadHash && appConfig.HashCommand != "" && record.ContentHash != "" {
-				if err := verifyRemoteHash(appConfig.Host, appConfig.User, appConfig.Pass, record.RemotePath, appConfig.HashCommand, record.ContentHash); err != nil {
-					log.Printf("skip prune for %s: hash verification failed - %v", localPath, err)
-					continue
-				}
-			}
-			if err := archiveLocalFile(localPath, record); err != nil {
-				return err
-			}
-			record.Placeholder = true
-			record.ExpiresAt = now
-			state.Records[localPath] = record
+		if !record.IsExpired(now) {
+			return nil
 		}
-	}
-	return nil
+		noVerification := !appConfig.VerifyUploadSize && !appConfig.VerifyUploadHash
+		if noVerification && !appConfig.AllowUnsafeFreeze {
+			log.Printf("skip prune for %s: no integrity checks enabled and allow-unsafe-freeze is off", localPath)
+			return nil
+		}
+		remoteSize, err := client.FileSize(record.RemotePath)
+		if err != nil {
+			log.Printf("skip prune for %s: remote file missing - %v", localPath, err)
+			return nil
+		}
+		if appConfig.VerifyUploadSize && record.FileSize > 0 && remoteSize != record.FileSize {
+			log.Printf("skip prune for %s: size mismatch local=%d remote=%d", localPath, record.FileSize, remoteSize)
+			return nil
+		}
+		if appConfig.VerifyUploadHash && appConfig.HashCommand != "" && record.ContentHash != "" {
+			if err := verifyRemoteHash(appConfig.Host, appConfig.User, appConfig.Pass, record.RemotePath, appConfig.HashCommand, record.ContentHash); err != nil {
+				log.Printf("skip prune for %s: hash verification failed - %v", localPath, err)
+				return nil
+			}
+		}
+		if err := archiveLocalFile(localPath, record); err != nil {
+			return err
+		}
+		record.Placeholder = true
+		record.ExpiresAt = now
+		return state.Put(localPath, record)
+	})
 }
 
 func restorePlaceholderIfNeeded(path string, client *ftp.ServerConn, state *State) error {
-	record, ok := state.Records[path]
+	record, ok := state.Get(path)
 	if !ok {
 		return nil
 	}
@@ -502,8 +587,7 @@ func restorePlaceholderIfNeeded(path string, client *ftp.ServerConn, state *Stat
 	record.Placeholder = false
 	record.UploadedAt = time.Now()
 	record.ExpiresAt = time.Now().Add(retentionDuration())
-	state.Records[path] = record
-	return nil
+	return state.Put(path, record)
 }
 
 // FTPCapabilities describes which integrity commands the FTP server supports.
@@ -646,13 +730,13 @@ func verifyRemoteHash(host, user, pass, remotePath, command, expectedHash string
 func restoreSingleFile(frozenPath string) error {
 	originalPath := strings.TrimSuffix(frozenPath, ".frozen")
 
-	metadataPath := filepath.Join(appConfig.Root, metadataDirName, "index.json")
 	state := newState()
-	if err := state.Load(metadataPath); err != nil {
-		return fmt.Errorf("cannot load state: %w", err)
+	if err := state.Open(dbPath(appConfig.Root)); err != nil {
+		return fmt.Errorf("cannot open state: %w", err)
 	}
+	defer state.Close()
 
-	record, ok := state.Records[originalPath]
+	record, ok := state.Get(originalPath)
 	if !ok || !record.Placeholder {
 		return fmt.Errorf("no archive record found for %s", originalPath)
 	}
@@ -670,8 +754,7 @@ func restoreSingleFile(frozenPath string) error {
 	record.Placeholder = false
 	record.UploadedAt = time.Now()
 	record.ExpiresAt = time.Now().Add(retentionDuration())
-	state.Records[originalPath] = record
-	return state.Save(metadataPath)
+	return state.Put(originalPath, record)
 }
 
 // installShellIntegration registers .frozen files with the OS so double-clicking restores them.
@@ -782,18 +865,55 @@ Start-Sleep -Seconds 999999
 	}
 }
 
+// backupIndexToFTP uploads the local index.db to FTP as a dated backup.
+func backupIndexToFTP(root, host, user, pass, ftpRoot string) error {
+	db := dbPath(root)
+	f, err := os.Open(db)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "unknown"
+	}
+	datestamp := time.Now().Format("2006-01-02")
+	remote := filepath.ToSlash(filepath.Join(ftpRoot, ".freezer-backups",
+		fmt.Sprintf("index-%s-%s.db", hostname, datestamp)))
+
+	client, err := connectFTP(host, user, pass)
+	if err != nil {
+		return err
+	}
+	defer client.Quit()
+
+	if err := ensureRemoteDir(client, filepath.ToSlash(filepath.Dir(remote))); err != nil {
+		return err
+	}
+	if err := client.Stor(remote, f); err != nil {
+		return err
+	}
+	log.Printf("index backup uploaded to %s", remote)
+
+	// Update backup timestamp in config
+	appConfig.LastIndexBackup = time.Now()
+	_ = saveConfig(appConfig)
+	return nil
+}
+
 func runColdStorage(root, host, user, pass string) error {
 	var cleanup func()
 	if appConfig.PreventSleepDuringSync {
 		cleanup = preventSleep()
 		defer cleanup()
 	}
-	
-	metadataPath := filepath.Join(root, metadataDirName, "index.json")
+
 	state := newState()
-	if err := state.Load(metadataPath); err != nil {
+	if err := state.Open(dbPath(root)); err != nil {
 		return err
 	}
+	defer state.Close()
 
 	client, err := connectFTP(host, user, pass)
 	if err != nil {
@@ -807,18 +927,23 @@ func runColdStorage(root, host, user, pass string) error {
 	if err := pruneExpired(client, state); err != nil {
 		return err
 	}
-	if err := state.Save(metadataPath); err != nil {
-		return err
+
+	// Weekly index backup to FTP
+	if time.Since(appConfig.LastIndexBackup) >= 7*24*time.Hour {
+		if err := backupIndexToFTP(root, host, user, pass, appConfig.FTPRoot); err != nil {
+			log.Printf("index backup failed: %v", err)
+		}
 	}
+
 	return nil
 }
 
 func restorePlaceholderFiles(root, host, user, pass string) error {
-	metadataPath := filepath.Join(root, metadataDirName, "index.json")
 	state := newState()
-	if err := state.Load(metadataPath); err != nil {
+	if err := state.Open(dbPath(root)); err != nil {
 		return err
 	}
+	defer state.Close()
 
 	client, err := connectFTP(host, user, pass)
 	if err != nil {
@@ -826,9 +951,9 @@ func restorePlaceholderFiles(root, host, user, pass string) error {
 	}
 	defer client.Quit()
 
-	for localPath, record := range state.Records {
+	return state.ForEach(func(localPath string, record Record) error {
 		if !record.Placeholder {
-			continue
+			return nil
 		}
 		if err := restoreFile(client, localPath, record); err != nil {
 			return err
@@ -836,10 +961,8 @@ func restorePlaceholderFiles(root, host, user, pass string) error {
 		record.Placeholder = false
 		record.UploadedAt = time.Now()
 		record.ExpiresAt = time.Now().Add(retentionDuration())
-		state.Records[localPath] = record
-	}
-
-	return state.Save(metadataPath)
+		return state.Put(localPath, record)
+	})
 }
 
 func openFolder(path string) {

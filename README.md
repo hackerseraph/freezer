@@ -48,13 +48,17 @@ A small Go project for using external storage as cold storage. Centered around l
 
 ### Design Philosophy
 
-Freezer is a fully client-side cold storage manager. There is no server component, no daemon running on the FTP host, and no central coordination service. Every decision about what to archive, when to archive it, and when to restore it is made entirely on the local machine using a single JSON state file. The FTP server is treated as a dumb block store: it holds bytes and returns them on request. It knows nothing about expiry dates, file relationships, or Freezer itself.
+Freezer is a fully client-side cold storage manager. There is no server component, no daemon running on the FTP host, and no central coordination service. Every decision about what to archive, when to archive it, and when to restore it is made entirely on the local machine using a bbolt embedded database. The FTP server is treated as a dumb block store: it holds bytes and returns them on request. It knows nothing about expiry dates, file relationships, or Freezer itself.
 
 This design means Freezer is simple to deploy, requires no special software on the server side, and works with any standard FTP endpoint including NAS devices, shared hosting, and home servers. The trade-off is that all state is local and there is no built-in mechanism for two machines to share a consistent view of the archive.
 
 ### The State Index
 
-All tracking is done through a single file: `.coldstorage/index.json` inside your configured root folder. This file is the complete source of truth for Freezer. If it is deleted, Freezer has no memory of what has been archived and will treat all files as new on the next sync.
+All tracking is done through a bbolt embedded B-tree database at `.coldstorage/index.db` inside your configured root folder. bbolt is a pure-Go, zero-CGo, single-file embedded database. It stores records as B-tree nodes, provides O(log n) key lookups, and writes each record change individually rather than rewriting the entire file. This makes it fast and efficient even with hundreds of thousands of tracked files.
+
+The database is opened once per sync cycle and closed when the cycle completes. Each record write is its own ACID transaction, so a crash mid-sync leaves the database consistent rather than corrupt.
+
+If a legacy `index.json` file is found on first open and the database is empty, records are automatically migrated and the old file is renamed to `index.json.migrated`.
 
 Each entry in the index is keyed by the absolute local path of the file and contains:
 
@@ -69,7 +73,7 @@ Each entry in the index is keyed by the absolute local path of the file and cont
 | `last_modified` | timestamp | File modification time recorded at upload |
 | `file_size` | int64 | File size in bytes recorded at upload |
 
-The index is read into memory at the start of each operation, modified in place, and written back to disk atomically at the end. It is not a database and does not support concurrent writers.
+The index is updated record-by-record as files are processed. Individual record writes are committed immediately as ACID transactions. No full file rewrite occurs.
 
 ### The File Lifecycle
 
@@ -149,6 +153,12 @@ Because all state is local, two machines pointing at the same FTP root folder op
 This is intentional for single-user use across multiple machines: each machine manages its own local disk independently. The FTP server acts as a shared pool of archived content but not as a coordination layer.
 
 For multi-user shared archives, this architecture requires extension. File locking, shared state, and access control are listed in the planned features section.
+
+### Index Backup
+
+After each sync cycle, Freezer checks whether it has been more than 7 days since the last index backup. If so, it uploads a copy of `index.db` to `<ftp-root>/.freezer-backups/index-<hostname>-<date>.db` on the FTP server. The hostname is included in the filename so that multiple machines backing up to the same FTP root do not overwrite each other's backups.
+
+If the local index is lost or corrupted, you can recover by downloading the most recent backup from FTP and placing it at `.coldstorage/index.db` in your root folder. Freezer will resume from that point with no re-upload of files that were already archived.
 
 ### State Loss and Recovery
 

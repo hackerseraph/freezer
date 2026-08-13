@@ -57,6 +57,7 @@ func retentionDuration() time.Duration {
 var appConfig Config
 var settingsMode bool
 var restorePath string
+var aboutMode bool
 
 // Config holds runtime settings for the tray app.
 type Config struct {
@@ -297,6 +298,7 @@ func loadConfig() Config {
 	}
 
 	flag.BoolVar(&settingsMode, "settings", false, "open the settings window")
+	flag.BoolVar(&aboutMode, "about", false, "open the about window")
 	flag.StringVar(&restorePath, "restore", "", "restore a single .frozen file by path")
 	flag.StringVar(&cfg.Root, "root", cfg.Root, "Local folder to sync")
 	flag.StringVar(&cfg.Host, "host", cfg.Host, "FTP host")
@@ -1230,6 +1232,12 @@ func (t compactTheme) Size(name fyne.ThemeSizeName) float32 {
 
 func launchSettingsProcess() error {
 	cmd := exec.Command(os.Args[0], "--settings")
+	cmd.Env = os.Environ()
+	return cmd.Start()
+}
+
+func launchAboutProcess() error {
+	cmd := exec.Command(os.Args[0], "--about")
 	cmd.Env = os.Environ()
 	return cmd.Start()
 }
@@ -2305,7 +2313,11 @@ func onReady() {
 			case <-openFolderItem.ClickedCh:
 				openFolder(appConfig.Root)
 			case <-aboutItem.ClickedCh:
-				go showAboutWindow()
+				go func() {
+					if err := launchAboutProcess(); err != nil {
+						log.Printf("failed to launch about window: %v", err)
+					}
+				}()
 			case <-quitItem.ClickedCh:
 				systray.Quit()
 				return
@@ -2355,6 +2367,10 @@ func main() {
 	if settingsMode {
 		log.Println("Opening settings window")
 		runSettingsWindow()
+		return
+	}
+	if aboutMode {
+		showAboutWindow()
 		return
 	}
 	log.Printf("Tray app starting in %s", appConfig.Root)

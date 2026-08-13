@@ -391,6 +391,7 @@ To uninstall: delete the `HKCU\Software\Classes\.frozen` and `HKCU\Software\Clas
 - Magic byte detection: read the first bytes of each file before compressing and compare against a table of known compressed format signatures (JPEG, PNG, MP4, ZIP, GZ, ZSTD, etc.); skip compression automatically for files that are already compressed to avoid wasted CPU and potentially larger output
 - Compression level setting: expose a slider in Storage Settings to let users trade transfer speed against storage savings
 - Compressed file format: extend the Freezer file envelope (FRZR magic header) with a compression flag so the correct decompression is applied on restore regardless of when the file was archived
+- Size tracking in the index: record both the original on-disk size and the compressed/encrypted size that was sent to FTP for every file; use these values during rewarm planning to calculate whether there is enough local disk space to fully decompress and restore a file before downloading it, preventing a partially-written restore that runs out of space mid-transfer
 
 ### Multi-User and Access Control
 - File locking: advisory locks to prevent simultaneous archive/restore conflicts when multiple users or machines share the same FTP root

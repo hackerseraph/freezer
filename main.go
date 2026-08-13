@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,6 +62,9 @@ type Config struct {
 	PreventSleepDuringSync bool
 	ExcludedFolders        []string
 	RetentionDays          int
+	VerifyUploadSize       bool
+	VerifyUploadHash       bool
+	HashCommand            string
 	Weekdays               [7]bool
 	SyncHour               int
 	SyncMinute             int
@@ -75,6 +80,7 @@ type Record struct {
 	Placeholder  bool      `json:"placeholder"`
 	ContentHash  string    `json:"content_hash,omitempty"`
 	LastModified time.Time `json:"last_modified"`
+	FileSize     int64     `json:"file_size,omitempty"`
 }
 
 // IsExpired returns true when the file should be removed from local disk.
@@ -102,6 +108,9 @@ func defaultConfig() Config {
 		PreventSleepDuringSync: false,
 		ExcludedFolders:        []string{},
 		RetentionDays:          defaultRetentionDays,
+		VerifyUploadSize:       true,
+		VerifyUploadHash:       false,
+		HashCommand:            "",
 		Weekdays:               [7]bool{},
 		SyncHour:               23,
 		SyncMinute:             0,
@@ -428,6 +437,7 @@ func syncFolder(root string, client *ftp.ServerConn, state *State) error {
 				Placeholder:  false,
 				ContentHash:  contentHash,
 				LastModified: info.ModTime(),
+				FileSize:     info.Size(),
 			}
 		}
 		return nil
@@ -441,9 +451,22 @@ func pruneExpired(client *ftp.ServerConn, state *State) error {
 			continue
 		}
 		if record.IsExpired(now) {
-			if _, err := client.FileSize(record.RemotePath); err != nil {
+			remoteSize, err := client.FileSize(record.RemotePath)
+			if err != nil {
 				log.Printf("skip prune for %s: remote file missing - %v", localPath, err)
 				continue
+			}
+			// Size verification: confirm remote matches what we uploaded
+			if appConfig.VerifyUploadSize && record.FileSize > 0 && remoteSize != record.FileSize {
+				log.Printf("skip prune for %s: size mismatch local=%d remote=%d", localPath, record.FileSize, remoteSize)
+				continue
+			}
+			// Hash verification: confirm remote hash matches stored hash
+			if appConfig.VerifyUploadHash && appConfig.HashCommand != "" && record.ContentHash != "" {
+				if err := verifyRemoteHash(appConfig.Host, appConfig.User, appConfig.Pass, record.RemotePath, appConfig.HashCommand, record.ContentHash); err != nil {
+					log.Printf("skip prune for %s: hash verification failed - %v", localPath, err)
+					continue
+				}
 			}
 			if err := archiveLocalFile(localPath, record); err != nil {
 				return err
@@ -471,6 +494,141 @@ func restorePlaceholderIfNeeded(path string, client *ftp.ServerConn, state *Stat
 	record.UploadedAt = time.Now()
 	record.ExpiresAt = time.Now().Add(retentionDuration())
 	state.Records[path] = record
+	return nil
+}
+
+// FTPCapabilities describes which integrity commands the FTP server supports.
+type FTPCapabilities struct {
+	SIZE    bool // always true for modern servers
+	HASH    bool // RFC 3659 HASH extension
+	XMD5    bool // common proprietary extension
+	XCRC    bool // common proprietary extension
+	XSHA256 bool // common proprietary extension
+}
+
+// BestHashCommand returns the most reliable hash command available, or "".
+func (c FTPCapabilities) BestHashCommand() string {
+	switch {
+	case c.HASH:
+		return "HASH"
+	case c.XSHA256:
+		return "XSHA256"
+	case c.XMD5:
+		return "XMD5"
+	case c.XCRC:
+		return "XCRC"
+	default:
+		return ""
+	}
+}
+
+// Summary returns a human-readable list of detected capabilities.
+func (c FTPCapabilities) Summary() string {
+	var parts []string
+	if c.SIZE {
+		parts = append(parts, "SIZE")
+	}
+	if c.HASH {
+		parts = append(parts, "HASH")
+	}
+	if c.XSHA256 {
+		parts = append(parts, "XSHA256")
+	}
+	if c.XMD5 {
+		parts = append(parts, "XMD5")
+	}
+	if c.XCRC {
+		parts = append(parts, "XCRC")
+	}
+	if len(parts) == 0 {
+		return "No integrity commands detected"
+	}
+	return "Detected: " + strings.Join(parts, ", ")
+}
+
+// readFTPResponse reads a (possibly multi-line) FTP response from the connection.
+func readFTPResponse(r *bufio.Reader) string {
+	var sb strings.Builder
+	for {
+		line, err := r.ReadString('\n')
+		sb.WriteString(line)
+		if err != nil || (len(line) >= 4 && line[3] == ' ') {
+			break
+		}
+	}
+	return sb.String()
+}
+
+// probeFTPCapabilities connects to the FTP server and probes FEAT to discover
+// which integrity commands are available.
+func probeFTPCapabilities(host, user, pass string) (FTPCapabilities, error) {
+	caps := FTPCapabilities{SIZE: true}
+
+	conn, err := net.DialTimeout("tcp", host, 10*time.Second)
+	if err != nil {
+		return caps, err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+
+	r := bufio.NewReader(conn)
+	readFTPResponse(r) // greeting
+
+	if user != "" {
+		fmt.Fprintf(conn, "USER %s\r\n", user)
+		readFTPResponse(r)
+		fmt.Fprintf(conn, "PASS %s\r\n", pass)
+		readFTPResponse(r)
+	}
+
+	fmt.Fprintf(conn, "FEAT\r\n")
+	featResp := readFTPResponse(r)
+
+	for _, line := range strings.Split(featResp, "\n") {
+		feat := strings.ToUpper(strings.TrimSpace(line))
+		switch {
+		case strings.HasPrefix(feat, "HASH"):
+			caps.HASH = true
+		case strings.HasPrefix(feat, "XMD5"):
+			caps.XMD5 = true
+		case strings.HasPrefix(feat, "XCRC"):
+			caps.XCRC = true
+		case strings.HasPrefix(feat, "XSHA256"):
+			caps.XSHA256 = true
+		}
+	}
+
+	return caps, nil
+}
+
+// verifyRemoteHash sends a hash command to the FTP server over a raw TCP connection
+// and compares the result against the locally stored hash.
+func verifyRemoteHash(host, user, pass, remotePath, command, expectedHash string) error {
+	conn, err := net.DialTimeout("tcp", host, 15*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+
+	r := bufio.NewReader(conn)
+	readFTPResponse(r)
+	fmt.Fprintf(conn, "USER %s\r\n", user)
+	readFTPResponse(r)
+	fmt.Fprintf(conn, "PASS %s\r\n", pass)
+	readFTPResponse(r)
+	fmt.Fprintf(conn, "%s %s\r\n", command, remotePath)
+	resp := strings.TrimSpace(readFTPResponse(r))
+
+	// Hash response formats vary: "251 hash" or "213 algo hash"
+	parts := strings.Fields(resp)
+	if len(parts) < 2 {
+		return fmt.Errorf("unexpected hash response: %s", resp)
+	}
+	remoteHash := strings.ToLower(parts[len(parts)-1])
+	if remoteHash != strings.ToLower(expectedHash) {
+		return fmt.Errorf("hash mismatch: expected %s got %s", expectedHash, remoteHash)
+	}
 	return nil
 }
 
@@ -1243,6 +1401,63 @@ func runSettingsWindow() {
 		passwordEntry,
 		widget.NewLabel("FTP root folder"),
 		ftpRootEntry,
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Server Capabilities", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel("Probe the server to discover which integrity checks are available."),
+	)
+
+	capStatusLabel := widget.NewLabel("")
+	verifySizeCheck := widget.NewCheck("Verify file size before archiving (SIZE)", func(bool) {})
+	verifySizeCheck.SetChecked(appConfig.VerifyUploadSize)
+	verifyHashCheck := widget.NewCheck("Verify file hash before archiving", func(bool) {})
+	verifyHashCheck.SetChecked(appConfig.VerifyUploadHash)
+	verifyHashCheck.Disable() // enabled only if a hash command is detected
+
+	probeBtn := widget.NewButton("Probe server capabilities", nil)
+	probeBtn.OnTapped = func() {
+		host := strings.TrimSpace(hostEntry.Text)
+		user := strings.TrimSpace(userEntry.Text)
+		pass := strings.TrimSpace(passwordEntry.Text)
+		if host == "" || strings.Contains(host, "example.com") {
+			capStatusLabel.SetText("Enter a real FTP server first.")
+			return
+		}
+		probeBtn.Disable()
+		capStatusLabel.SetText("Probing...")
+		go func() {
+			caps, err := probeFTPCapabilities(host, user, pass)
+			if err != nil {
+				capStatusLabel.SetText("Probe failed: " + err.Error())
+				probeBtn.Enable()
+				return
+			}
+			capStatusLabel.SetText(caps.Summary())
+			verifySizeCheck.SetChecked(caps.SIZE)
+			if caps.BestHashCommand() != "" {
+				verifyHashCheck.SetChecked(true)
+				verifyHashCheck.Enable()
+				verifyHashCheck.Text = "Verify file hash before archiving (" + caps.BestHashCommand() + ")"
+				verifyHashCheck.Refresh()
+			} else {
+				verifyHashCheck.SetChecked(false)
+				verifyHashCheck.Disable()
+				verifyHashCheck.Text = "Verify file hash before archiving (not supported by server)"
+				verifyHashCheck.Refresh()
+			}
+			probeBtn.Enable()
+		}()
+	}
+
+	capPanel := container.NewVBox(
+		container.NewHBox(probeBtn),
+		container.NewPadded(capStatusLabel),
+		container.NewPadded(verifySizeCheck),
+		container.NewPadded(verifyHashCheck),
+	)
+
+	ftpPanelFull := container.NewVBox(
+		ftpPanel,
+		capPanel,
 	)
 
 	// Exclusions panel
@@ -1349,7 +1564,7 @@ func runSettingsWindow() {
 	sections := map[string]fyne.CanvasObject{
 		"Power":         powerPanel,
 		"Sync Schedule": schedulePanel,
-		"FTP & Folder":  ftpPanel,
+		"FTP & Folder":  ftpPanelFull,
 		"Exclusions":    exclusionsPanel,
 		"Storage":       storagePanel,
 		"System":        systemPanel,
@@ -1393,6 +1608,15 @@ func runSettingsWindow() {
 		cfg.SyncOnBattery = batteryCheck.Checked
 		cfg.PreventSleepDuringSync = preventSleepCheck.Checked
 		cfg.RetentionDays = retentionDays
+		cfg.VerifyUploadSize = verifySizeCheck.Checked
+		cfg.VerifyUploadHash = verifyHashCheck.Checked
+		if verifyHashCheck.Checked {
+			// Extract command name from checkbox label e.g. "...(XMD5)"
+			label := verifyHashCheck.Text
+			if i := strings.LastIndex(label, "("); i >= 0 {
+				cfg.HashCommand = strings.TrimSuffix(label[i+1:], ")")
+			}
+		}
 		var excluded []string
 		for _, chk := range excludeCheckboxes {
 			if chk.Checked {

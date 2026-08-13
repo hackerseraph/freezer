@@ -66,6 +66,42 @@ go run .
 ## Test
 go test ./...
 
+## How Record Keeping Works
+
+Freezer maintains a state index at `.coldstorage/index.json` inside your root folder. This file is the source of truth for everything Freezer knows about your archived files. It functions like an inode map: the full local path of each file is the key, and the value is a record containing all the metadata Freezer needs to manage that file.
+
+### The Record Structure
+
+Each tracked file has a record with the following fields:
+
+- `local_path` - the absolute path where the file lives (or lived) on disk
+- `remote_path` - the full path on the FTP server where the content is stored
+- `uploaded_at` - timestamp of the last successful upload
+- `expires_at` - when the local copy is scheduled to be replaced with a .frozen stub
+- `placeholder` - true if the file has been archived and only a .frozen stub exists locally
+- `content_hash` - SHA-256 hash of the file content at the time of upload
+- `last_modified` - the file's modification time on disk at the time of upload
+
+### How Sync Uses the Record
+
+When Freezer syncs, it walks your root folder and checks each file against the index. A file is uploaded if there is no record for it, if the local modification time is newer than what was recorded, or if the expiry has passed. After a successful upload the record is written with the new hash, timestamps, and expiry date.
+
+When the expiry date passes, Freezer checks that the file exists on the FTP server and then replaces the local file with a `.frozen` stub. The record is updated to mark `placeholder: true`. The original content remains on FTP indefinitely.
+
+When you restore a file, Freezer downloads from the remote path in the record, writes the content back to the original local path, deletes the `.frozen` stub, and resets the expiry clock.
+
+### File Integrity and FTP Limitations
+
+At upload time Freezer computes a SHA-256 hash of the local file and stores it in the record. This hash is used to detect whether a file has changed since it was last uploaded.
+
+However, verifying that the file on the FTP server has the same hash is a different problem. Standard FTP (RFC 959) has no hash or checksum command. The only standard way to check the remote file is to download it again and hash it locally, which would double the bandwidth cost of every archive operation.
+
+Some FTP servers support optional extensions like `XCRC`, `XSHA1`, `XSHA256`, or the RFC 3659 `HASH` command, but these are not guaranteed to be present and a plain FTP server will not have them.
+
+What Freezer currently does before archiving a local file is call the standard `SIZE` command to confirm the remote file exists and is non-zero. This catches missing or empty files but will not catch a truncated upload where the server accepted a partial write without error.
+
+Adding optional hash verification via the extended `HASH` command (falling back to size-only when the server does not support it) is listed as a planned improvement.
+
 ## Understanding Shell Integration
 
 Freezer replaces archived files with `.frozen` stub files so you can see what has been moved to cold storage without losing the file name or folder structure. Shell integration teaches the operating system to open those stubs with Freezer when you double-click them, triggering an automatic restore from your FTP server.

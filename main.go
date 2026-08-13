@@ -43,6 +43,7 @@ import (
 
 const defaultRetentionDays = 60
 const metadataDirName = ".coldstorage"
+const appVersion = "0.1.0"
 
 // retentionDays returns the configured retention period, falling back to the default.
 func retentionDuration() time.Duration {
@@ -2138,6 +2139,78 @@ func measureFTPThroughput(host, user, pass, ftpRoot string) (uploadMbps float64,
 	return uploadMbps, downloadMbps, nil
 }
 
+func showAboutWindow() {
+	a := app.NewWithID("com.freezer.about")
+	a.Settings().SetTheme(compactTheme{Theme: theme.DefaultTheme()})
+	w := a.NewWindow("About Freezer")
+	w.Resize(fyne.NewSize(620, 560))
+	w.SetFixedSize(false)
+	w.SetCloseIntercept(func() { w.Close(); a.Quit() })
+
+	disclaimer := `DISCLAIMER — NO WARRANTY — LIMITATION OF LIABILITY
+
+Freezer is provided "as is", without warranty of any kind, express or
+implied, including but not limited to the warranties of merchantability,
+fitness for a particular purpose, and non-infringement.
+
+In no event shall the authors or copyright holders be liable for any
+claim, damages, or other liability — whether in an action of contract,
+tort, or otherwise — arising from, out of, or in connection with the
+software or the use or other dealings in the software.
+
+THIS INCLUDES BUT IS NOT LIMITED TO: loss of data, loss of encrypted
+archives due to forgotten passphrases, FTP server outages, file
+corruption, accidental deletion, interrupted sync operations, or any
+financial loss resulting from inability to access archived files.
+
+YOU ARE SOLELY RESPONSIBLE FOR:
+  - Maintaining a secure backup of your encryption passphrase
+  - Verifying that files have been successfully archived before deletion
+  - Ensuring your FTP server is reliable and has sufficient storage
+  - Any data that cannot be recovered due to key loss or server failure
+
+Use this software at your own risk.`
+
+	privacy := `PRIVACY POLICY
+
+Freezer collects no data about you, your files, or your usage.
+
+  - No telemetry
+  - No analytics
+  - No crash reporting
+  - No usage statistics
+  - No network connections except to your own configured FTP server
+  - No third-party services of any kind
+
+All data processed by Freezer stays on your local machine and your own
+FTP server. The developers have no access to your files, your settings,
+your encryption keys, or any other information about your use of this
+software.
+
+The only outbound network activity this application performs is FTP
+transfers to the server address you configure yourself.`
+
+	closeBtn := widget.NewButton("Close", func() { w.Close(); a.Quit() })
+	closeBtn.Importance = widget.HighImportance
+
+	content := container.NewScroll(container.NewVBox(
+		widget.NewLabelWithStyle("Freezer  v"+appVersion, fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		widget.NewLabel("Client-side cold storage with FTP archiving and AES-256-GCM encryption."),
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Disclaimer", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel(disclaimer),
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Privacy Policy", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel(privacy),
+		widget.NewSeparator(),
+		container.NewHBox(layout.NewSpacer(), closeBtn, layout.NewSpacer()),
+	))
+
+	w.SetContent(content)
+	w.Show()
+	a.Run()
+}
+
 // launchPassphrasePrompt opens a small Fyne window asking for the encryption passphrase.
 // The derived key is stored in memory only for the current session.
 func launchPassphrasePrompt() {
@@ -2205,6 +2278,7 @@ func onReady() {
 	restoreItem := systray.AddMenuItem("Restore placeholders", "Download archived files back to disk")
 	openFolderItem := systray.AddMenuItem("Open archive folder", "Open the local cold-storage folder")
 	systray.AddSeparator()
+	aboutItem := systray.AddMenuItem("About Freezer", "Version info, privacy policy, and disclaimer")
 	quitItem := systray.AddMenuItem("Quit", "Exit the app")
 
 	go func() {
@@ -2230,6 +2304,8 @@ func onReady() {
 				}
 			case <-openFolderItem.ClickedCh:
 				openFolder(appConfig.Root)
+			case <-aboutItem.ClickedCh:
+				go showAboutWindow()
 			case <-quitItem.ClickedCh:
 				systray.Quit()
 				return

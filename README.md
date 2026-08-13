@@ -181,6 +181,9 @@ The `.frozen` stub files contain the remote path of the archived content. Anyone
 
 Host-side encryption (encrypting content before upload so the FTP server holds only ciphertext) is listed in the planned features section.
 
+- [Privacy Policy](#privacy-policy)
+- [Disclaimer](#disclaimer)
+
 ## Installation
 
 ### Debian / Ubuntu / Linux Mint
@@ -418,3 +421,35 @@ To uninstall: delete the `HKCU\Software\Classes\.frozen` and `HKCU\Software\Clas
 - Partial rewarm with priority ordering: when there is insufficient space to restore everything, allow the user to choose which files or folders to restore first, or restore by most-recently-archived order until the disk is full
 - Date-range rewarm slider: when disk space is limited, show a slider letting the user select how far back to rewarm (e.g. last 7 days, last 30 days). Tick marks on the slider correspond to real archive dates, and the UI calculates and displays the cumulative size that would be restored at each position so the user can find the cutoff that fits their available space before committing
 - Rewarm progress reporting: show per-file and overall progress during a full restore so the user knows how long the operation will take and which files have been recovered
+
+## Privacy Policy
+
+Freezer collects no data about you, your files, or your usage.
+
+- No telemetry
+- No analytics
+- No crash reporting
+- No usage statistics
+- No network connections except to your own configured FTP server
+- No third-party services of any kind
+
+All data processed by Freezer stays on your local machine and your own FTP server. The developers have no access to your files, your settings, your encryption keys, or any other information about your use of this software.
+
+The only outbound network activity this application performs is FTP transfers to the server address you configure yourself.
+
+## Disclaimer
+
+Freezer is provided "as is", without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement.
+
+In no event shall the authors or copyright holders be liable for any claim, damages, or other liability — whether in an action of contract, tort, or otherwise — arising from, out of, or in connection with the software or the use or other dealings in the software.
+
+This includes but is not limited to: loss of data, loss of encrypted archives due to forgotten passphrases, FTP server outages, file corruption, accidental deletion, interrupted sync operations, or any financial loss resulting from inability to access archived files.
+
+**You are solely responsible for:**
+
+- Maintaining a secure backup of your encryption passphrase. If it is lost, encrypted archives cannot be recovered by anyone.
+- Verifying that files have been successfully archived to your FTP server before relying on Freezer as your only copy.
+- Ensuring your FTP server is reliable, has sufficient storage, and is accessible when restores are needed.
+- Any data that cannot be recovered due to key loss, server failure, misconfiguration, or software bugs.
+
+Use this software at your own risk.

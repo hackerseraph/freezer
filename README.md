@@ -8,6 +8,19 @@ A small Go project for using external storage as cold storage. Centered around l
   - [Windows 10 / 11](#windows-10--11)
 - [Run](#run)
 - [Test](#test)
+- [Technical Architecture](#technical-architecture)
+  - [Design Philosophy](#design-philosophy)
+  - [The State Index](#the-state-index)
+  - [The File Lifecycle](#the-file-lifecycle)
+  - [Sync Phase](#sync-phase)
+  - [Prune Phase](#prune-phase)
+  - [Restore Phase](#restore-phase)
+  - [Retention and the Expiry Clock](#retention-and-the-expiry-clock)
+  - [File Change Detection](#file-change-detection)
+  - [FTP as a Dumb Store](#ftp-as-a-dumb-store)
+  - [Multi-Machine Behaviour](#multi-machine-behaviour)
+  - [State Loss and Recovery](#state-loss-and-recovery)
+  - [Security Considerations](#security-considerations)
 - [How Record Keeping Works](#how-record-keeping-works)
   - [The Record Structure](#the-record-structure)
   - [How Sync Uses the Record](#how-sync-uses-the-record)
@@ -30,6 +43,133 @@ A small Go project for using external storage as cold storage. Centered around l
   - [Migration and Uninstall](#migration-and-uninstall)
   - [Scheduling](#scheduling)
   - [Uninstall and Data Recovery](#uninstall-and-data-recovery)
+
+## Technical Architecture
+
+### Design Philosophy
+
+Freezer is a fully client-side cold storage manager. There is no server component, no daemon running on the FTP host, and no central coordination service. Every decision about what to archive, when to archive it, and when to restore it is made entirely on the local machine using a single JSON state file. The FTP server is treated as a dumb block store: it holds bytes and returns them on request. It knows nothing about expiry dates, file relationships, or Freezer itself.
+
+This design means Freezer is simple to deploy, requires no special software on the server side, and works with any standard FTP endpoint including NAS devices, shared hosting, and home servers. The trade-off is that all state is local and there is no built-in mechanism for two machines to share a consistent view of the archive.
+
+### The State Index
+
+All tracking is done through a single file: `.coldstorage/index.json` inside your configured root folder. This file is the complete source of truth for Freezer. If it is deleted, Freezer has no memory of what has been archived and will treat all files as new on the next sync.
+
+Each entry in the index is keyed by the absolute local path of the file and contains:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `local_path` | string | Absolute path to the file on local disk |
+| `remote_path` | string | Full path on the FTP server |
+| `uploaded_at` | timestamp | When the last successful upload completed |
+| `expires_at` | timestamp | When the local copy is scheduled to be archived |
+| `placeholder` | bool | True if the file is currently a .frozen stub |
+| `content_hash` | string | SHA-256 of the file content at upload time |
+| `last_modified` | timestamp | File modification time recorded at upload |
+| `file_size` | int64 | File size in bytes recorded at upload |
+
+The index is read into memory at the start of each operation, modified in place, and written back to disk atomically at the end. It is not a database and does not support concurrent writers.
+
+### The File Lifecycle
+
+A file moves through the following states:
+
+1. **Untracked** — the file exists on disk but has no entry in the index. This is the initial state for all files before Freezer first runs.
+2. **Tracked and warm** — the file has been uploaded to FTP. The local copy is intact and `placeholder` is false. The expiry clock is running.
+3. **Expired and pending prune** — `expires_at` has passed on the next prune run. The file is still present locally but will be archived on the next sync cycle.
+4. **Frozen** — the local file has been removed and replaced with a `.frozen` stub. `placeholder` is true. The content lives only on the FTP server.
+5. **Restored** — the file has been downloaded from FTP back to its original path. The stub is deleted. `placeholder` is set back to false and the expiry clock resets from the moment of restore.
+
+### Sync Phase
+
+On every sync cycle, `syncFolder` performs a depth-first walk of the root folder. For each regular file it encounters (skipping the `.coldstorage` directory, `.frozen` stubs, and any excluded subfolders) it applies the following logic:
+
+- If there is no record in the index, upload the file and create a record with `expires_at = now + retention_days`.
+- If the file's modification time on disk is newer than the `last_modified` value in the record, re-upload the file and reset `expires_at`.
+- If `expires_at` has already passed and the file is still on disk, re-upload and reset the expiry clock. (This handles the case where the prune phase has not yet run.)
+- If the record exists, modification time matches, and expiry has not passed, skip the file entirely. No FTP connection is made.
+
+The FTP server is only contacted when a file actually needs to be uploaded. Unchanged files within their retention window are evaluated purely against the local index with no network activity.
+
+### Prune Phase
+
+After the sync phase completes, `pruneExpired` iterates all records in the index and identifies files where `placeholder` is false and `expires_at` is in the past. For each such file:
+
+1. A `SIZE` command is sent to the FTP server to confirm the remote file exists and is non-zero. If this fails, the file is skipped and a warning is logged. The local copy is never deleted if the remote copy cannot be confirmed.
+2. If size verification is enabled, the remote size returned by `SIZE` is compared against the `file_size` field in the record. A mismatch indicates a truncated or corrupt upload and the file is skipped.
+3. If hash verification is enabled and the server supports it (via `HASH`, `XMD5`, `XCRC`, or `XSHA256`), the remote hash is retrieved and compared against the stored `content_hash`. A mismatch skips the file.
+4. If all checks pass, the local file is deleted and a `.frozen` stub is written in its place. The stub is a plain text file containing the original filename, the archive date, the remote path, and instructions for restoring.
+5. The record is updated with `placeholder: true` and the index is saved.
+
+The local file is never deleted unless the remote copy has been positively confirmed to exist. If no verification method is available and the user has not enabled the "allow unsafe freeze" option, the file is skipped rather than archived blindly.
+
+### Restore Phase
+
+Restoring a file reverses the prune: the content is downloaded from `remote_path`, written to `local_path`, the `.frozen` stub is deleted, `placeholder` is set to false, and `expires_at` is reset to `now + retention_days`. The file re-enters the normal warm lifecycle from that point.
+
+Restoration can be triggered three ways:
+
+- **Restore all** from the tray menu runs `restorePlaceholderFiles`, which iterates all records with `placeholder: true` and restores each one.
+- **Double-click a .frozen stub** (after shell integration is installed) calls `freezer -restore /path/to/file.ext.frozen`, which looks up the record for the original path, connects to FTP, and restores only that file.
+- The internal `restorePlaceholderIfNeeded` function is available for programmatic use in future features such as on-demand restore before file access.
+
+### Retention and the Expiry Clock
+
+The retention period (configurable via the Storage slider, default 60 days) defines how long a file stays warm on local disk after its most recent upload. The clock starts at the moment of upload, not at the file's creation or modification time.
+
+This means a file written to disk 5 years ago but uploaded to Freezer for the first time today will expire 60 days from today, not 5 years ago. The local modification time is recorded in the index and used only to detect changes, not to calculate expiry.
+
+When a file is modified and re-uploaded, the expiry clock resets from the new upload time. A frequently edited file will never be archived as long as it continues to change within the retention window.
+
+### File Change Detection
+
+Freezer uses the file system modification time (`mtime`) as the primary signal for change detection. If `mtime` on disk is newer than the `last_modified` value stored in the index, the file is considered changed and re-uploaded regardless of content.
+
+A SHA-256 hash is also computed and stored at upload time. This hash is currently used for remote integrity verification (confirming the FTP copy matches what was sent) but is not used for local change detection. A future improvement would use the hash to skip re-uploads when `mtime` has changed but content has not (for example after a copy operation that updates timestamps without changing bytes).
+
+### FTP as a Dumb Store
+
+The FTP server requires no special configuration and runs no Freezer-specific software. Freezer uses a small subset of the FTP protocol:
+
+- `USER` / `PASS` for authentication
+- `CWD` / `MKD` for navigating and creating directories
+- `STOR` for uploading files
+- `RETR` for downloading files
+- `SIZE` for verifying file existence and size before archiving
+- `DELE` for cleaning up temporary throughput test files
+- `FEAT` for probing optional integrity extensions (HASH, XMD5, XCRC, XSHA256)
+
+The server holds files at the paths Freezer assigns. It has no awareness of expiry dates, placeholder status, or any other metadata. If you browse the FTP server directly you will see the archived files in the same folder structure as your local root, with no special markers.
+
+### Multi-Machine Behaviour
+
+Because all state is local, two machines pointing at the same FTP root folder operate completely independently. Each machine has its own `index.json` and its own expiry clocks. Machine A archiving a file does not cause Machine B to see it as archived, and Machine B restoring a file does not affect Machine A's records.
+
+This is intentional for single-user use across multiple machines: each machine manages its own local disk independently. The FTP server acts as a shared pool of archived content but not as a coordination layer.
+
+For multi-user shared archives, this architecture requires extension. File locking, shared state, and access control are listed in the planned features section.
+
+### State Loss and Recovery
+
+If `.coldstorage/index.json` is deleted or corrupted, Freezer loses all memory of what is archived. On the next sync it will attempt to re-upload every file in the root folder as if seeing them for the first time. Files that are currently frozen (`.frozen` stubs present on disk) will not be uploaded because they end in `.frozen` and are skipped by the walker. Their content remains on the FTP server but there will be no record pointing to it.
+
+To recover from state loss when frozen files are present:
+1. Do not run a sync until the index is rebuilt or restored from backup.
+2. If you have a backup of `index.json`, restore it.
+3. If no backup exists, you can manually restore frozen files by downloading them from the FTP server and recreating records, or by using "Restore all" from the tray if any index entries survive.
+
+Backing up `.coldstorage/index.json` regularly is strongly recommended. A future improvement will include automatic index snapshots.
+
+### Security Considerations
+
+FTP transmits credentials and file content in plaintext. Anyone with access to the network path between the client and server can intercept both. For use over untrusted networks, a VPN or SSH tunnel should wrap the FTP connection.
+
+Credentials are stored in the Freezer config file at `~/.config/coldstore/settings.json` (Linux) or `%APPDATA%\coldstore\settings.json` (Windows) with filesystem permissions set to the owning user only (0600 on Linux). They are not encrypted at rest.
+
+The `.frozen` stub files contain the remote path of the archived content. Anyone with access to the stub can determine where the file is stored on the FTP server. The stub does not contain credentials.
+
+Host-side encryption (encrypting content before upload so the FTP server holds only ciphertext) is listed in the planned features section.
 
 ## Installation
 

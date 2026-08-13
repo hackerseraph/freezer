@@ -43,7 +43,9 @@ import (
 
 const defaultRetentionDays = 60
 const metadataDirName = ".coldstorage"
-const appVersion = "0.1.0"
+
+// appVersion is set at build time via: -ldflags "-X main.appVersion=$(git describe --tags --always --dirty)"
+var appVersion = "dev"
 
 // retentionDays returns the configured retention period, falling back to the default.
 func retentionDuration() time.Duration {

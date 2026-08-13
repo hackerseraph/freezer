@@ -122,6 +122,7 @@ go test ./...
 - Migrate tray menu item: move all archived content from the current backend to a new one (e.g. FTP to Google Drive) without losing state, rewriting remote paths in the index as transfers complete
 - Uninstall tray menu item: rewarm all frozen files back to local disk, remove all .frozen stubs and the .coldstorage metadata directory, deregister shell integration, and optionally delete archived content from the remote backend, leaving the system in a clean pre-Freezer state
 - Pre-uninstall disk space check: calculate total rewarm size before starting and warn the user if there is not enough local space, offering the date-range partial restore slider if needed
+- Migration log: write a persistent log of every file transferred during a migration so that if the process is interrupted by a power outage or crash it can resume from where it left off rather than starting over, and any partially transferred files can be detected and retried
 
 ### Scheduling
 - Flexible schedules: cron-style scheduling beyond the current nightly fixed time, with per-folder schedule overrides

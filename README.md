@@ -148,7 +148,7 @@ The server holds files at the paths Freezer assigns. It has no awareness of expi
 
 ### Multi-Machine Behaviour
 
-Because all state is local, two machines pointing at the same FTP root folder operate completely independently. Each machine has its own `index.json` and its own expiry clocks. Machine A archiving a file does not cause Machine B to see it as archived, and Machine B restoring a file does not affect Machine A's records.
+Because all state is local, two machines pointing at the same FTP root folder operate completely independently. Each machine has its own `index.db` and its own expiry clocks. Machine A archiving a file does not cause Machine B to see it as archived, and Machine B restoring a file does not affect Machine A's records.
 
 This is intentional for single-user use across multiple machines: each machine manages its own local disk independently. The FTP server acts as a shared pool of archived content but not as a coordination layer.
 
@@ -162,14 +162,14 @@ If the local index is lost or corrupted, you can recover by downloading the most
 
 ### State Loss and Recovery
 
-If `.coldstorage/index.json` is deleted or corrupted, Freezer loses all memory of what is archived. On the next sync it will attempt to re-upload every file in the root folder as if seeing them for the first time. Files that are currently frozen (`.frozen` stubs present on disk) will not be uploaded because they end in `.frozen` and are skipped by the walker. Their content remains on the FTP server but there will be no record pointing to it.
+If `.coldstorage/index.db` is deleted or corrupted, Freezer loses all memory of what is archived. On the next sync it will attempt to re-upload every file in the root folder as if seeing them for the first time. Files that are currently frozen (`.frozen` stubs present on disk) will not be uploaded because they end in `.frozen` and are skipped by the walker. Their content remains on the FTP server but there will be no record pointing to it.
 
 To recover from state loss when frozen files are present:
 1. Do not run a sync until the index is rebuilt or restored from backup.
-2. If you have a backup of `index.json`, restore it.
+2. Download the most recent backup from FTP at `.freezer-backups/index-<hostname>-<date>.db` and place it at `.coldstorage/index.db` in your root folder.
 3. If no backup exists, you can manually restore frozen files by downloading them from the FTP server and recreating records, or by using "Restore all" from the tray if any index entries survive.
 
-Backing up `.coldstorage/index.json` regularly is strongly recommended. A future improvement will include automatic index snapshots.
+Weekly backups are uploaded automatically to your FTP server. Keep at least one recent backup accessible in case of local disk failure.
 
 ### Security Considerations
 
@@ -251,7 +251,7 @@ go test ./...
 
 ## How Record Keeping Works
 
-Freezer maintains a state index at `.coldstorage/index.json` inside your root folder. This file is the source of truth for everything Freezer knows about your archived files. It functions like an inode map: the full local path of each file is the key, and the value is a record containing all the metadata Freezer needs to manage that file.
+Freezer maintains a state index at `.coldstorage/index.db` inside your root folder. This bbolt database is the source of truth for everything Freezer knows about your archived files. It functions like an inode map: the full local path of each file is the key, and the value is a record containing all the metadata Freezer needs to manage that file.
 
 ### The Record Structure
 

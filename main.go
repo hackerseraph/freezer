@@ -1555,14 +1555,11 @@ func runSettingsWindow() {
 		retentionLabel.SetText(fmt.Sprintf("Keep files warm for %d days before freezing", retentionDays))
 	}
 
-	// Tick label row showing key intervals
-	tickRow := container.NewGridWithColumns(6,
-		widget.NewLabelWithStyle("7d", fyne.TextAlignLeading, fyne.TextStyle{}),
-		widget.NewLabelWithStyle("30d", fyne.TextAlignCenter, fyne.TextStyle{}),
-		widget.NewLabelWithStyle("60d", fyne.TextAlignCenter, fyne.TextStyle{}),
-		widget.NewLabelWithStyle("90d", fyne.TextAlignCenter, fyne.TextStyle{}),
-		widget.NewLabelWithStyle("180d", fyne.TextAlignCenter, fyne.TextStyle{}),
-		widget.NewLabelWithStyle("365d", fyne.TextAlignTrailing, fyne.TextStyle{}),
+	// Only label the two endpoints — these align exactly with the slider ends
+	tickRow := container.NewHBox(
+		widget.NewLabelWithStyle("7 days", fyne.TextAlignLeading, fyne.TextStyle{}),
+		layout.NewSpacer(),
+		widget.NewLabelWithStyle("365 days", fyne.TextAlignTrailing, fyne.TextStyle{}),
 	)
 
 	storagePanel := container.NewVBox(

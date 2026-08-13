@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -91,5 +92,47 @@ func TestRemotePathUsesConfiguredRemoteRoot(t *testing.T) {
 	remotePath = remotePathFromLocal("nested/file.txt", "/")
 	if remotePath != "/nested/file.txt" {
 		t.Fatalf("expected /nested/file.txt, got %s", remotePath)
+	}
+}
+
+func TestEncryptionRoundTrip(t *testing.T) {
+	salt, err := newEncryptionSalt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := deriveKey("test-passphrase", salt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plaintext := []byte("Hello, Freezer encryption test!")
+	ciphertext, err := encryptStream(bytes.NewReader(plaintext), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(ciphertext, plaintext) {
+		t.Fatal("ciphertext should not equal plaintext")
+	}
+
+	recovered, err := decryptBytes(ciphertext, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(recovered, plaintext) {
+		t.Fatalf("decrypted content does not match original: got %q want %q", recovered, plaintext)
+	}
+}
+
+func TestEncryptionWrongKeyFails(t *testing.T) {
+	salt, _ := newEncryptionSalt()
+	key1, _ := deriveKey("correct-passphrase", salt)
+	key2, _ := deriveKey("wrong-passphrase", salt)
+
+	ciphertext, err := encryptStream(bytes.NewReader([]byte("secret")), key1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decryptBytes(ciphertext, key2); err == nil {
+		t.Fatal("expected decryption with wrong key to fail")
 	}
 }

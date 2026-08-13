@@ -3,7 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -34,6 +38,7 @@ import (
 	"github.com/getlantern/systray"
 	"github.com/jlaffaye/ftp"
 	bbolt "go.etcd.io/bbolt"
+	"golang.org/x/crypto/argon2"
 )
 
 const defaultRetentionDays = 60
@@ -68,6 +73,9 @@ type Config struct {
 	HashCommand            string
 	AllowUnsafeFreeze      bool
 	LastIndexBackup        time.Time
+	EncryptionEnabled      bool
+	EncryptionPassphrase   string
+	EncryptionSalt         string // base64-encoded 32-byte random salt
 	Weekdays               [7]bool
 	SyncHour               int
 	SyncMinute             int
@@ -84,6 +92,7 @@ type Record struct {
 	ContentHash  string    `json:"content_hash,omitempty"`
 	LastModified time.Time `json:"last_modified"`
 	FileSize     int64     `json:"file_size,omitempty"`
+	Encrypted    bool      `json:"encrypted,omitempty"`
 }
 
 // IsExpired returns true when the file should be removed from local disk.
@@ -338,6 +347,81 @@ func loadConfig() Config {
 	return cfg
 }
 
+// encryptionMagic is the 4-byte header identifying an encrypted Freezer file.
+var encryptionMagic = []byte("FRZR")
+
+// deriveKey runs Argon2id on the passphrase and salt to produce a 32-byte AES key.
+func deriveKey(passphrase, saltB64 string) ([]byte, error) {
+	salt, err := base64.StdEncoding.DecodeString(saltB64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid encryption salt: %w", err)
+	}
+	// Argon2id: memory=64MB, iterations=3, parallelism=4, keyLen=32
+	key := argon2.IDKey([]byte(passphrase), salt, 3, 64*1024, 4, 32)
+	return key, nil
+}
+
+// newEncryptionSalt generates a fresh random 32-byte salt and returns it as base64.
+func newEncryptionSalt() (string, error) {
+	salt := make([]byte, 32)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(salt), nil
+}
+
+// encryptStream reads plaintext from r, encrypts with AES-256-GCM, and returns the ciphertext.
+// Format: [4-byte magic][1-byte version][12-byte nonce][ciphertext+16-byte tag]
+func encryptStream(r io.Reader, key []byte) ([]byte, error) {
+	plaintext, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize()) // 12 bytes
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
+
+	var buf bytes.Buffer
+	buf.Write(encryptionMagic)   // 4 bytes
+	buf.WriteByte(0x01)          // version
+	buf.Write(nonce)             // 12 bytes
+	buf.Write(ciphertext)        // ciphertext + 16-byte tag
+	return buf.Bytes(), nil
+}
+
+// decryptBytes decrypts an AES-256-GCM encrypted blob produced by encryptStream.
+func decryptBytes(data []byte, key []byte) ([]byte, error) {
+	if len(data) < 4+1+12+16 {
+		return nil, fmt.Errorf("encrypted file too short")
+	}
+	if !bytes.Equal(data[:4], encryptionMagic) {
+		return nil, fmt.Errorf("not a Freezer encrypted file")
+	}
+	// data[4] = version (reserved, currently 0x01)
+	nonce := data[5:17]
+	ciphertext := data[17:]
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return gcm.Open(nil, nonce, ciphertext, nil)
+}
+
 func connectFTP(host, user, pass string) (*ftp.ServerConn, error) {
 	conn, err := ftp.Dial(host)
 	if err != nil {
@@ -386,20 +470,38 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func uploadFile(client *ftp.ServerConn, localPath, remotePath string) error {
+// uploadFile uploads a local file to FTP, encrypting if encryption is configured.
+// Returns (encrypted bool, error).
+func uploadFile(client *ftp.ServerConn, localPath, remotePath string) (bool, error) {
 	f, err := os.Open(localPath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer f.Close()
 
 	remoteDir := filepath.ToSlash(filepath.Dir(remotePath))
 	if remoteDir != "." && remoteDir != "/" && remoteDir != "" {
 		if err := ensureRemoteDir(client, remoteDir); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return client.Stor(remotePath, f)
+
+	if appConfig.EncryptionEnabled && appConfig.EncryptionPassphrase != "" && appConfig.EncryptionSalt != "" {
+		key, err := deriveKey(appConfig.EncryptionPassphrase, appConfig.EncryptionSalt)
+		if err != nil {
+			return false, fmt.Errorf("key derivation failed: %w", err)
+		}
+		ciphertext, err := encryptStream(f, key)
+		if err != nil {
+			return false, fmt.Errorf("encryption failed: %w", err)
+		}
+		if err := client.Stor(remotePath, bytes.NewReader(ciphertext)); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	return false, client.Stor(remotePath, f)
 }
 
 func ensureRemoteDir(client *ftp.ServerConn, dir string) error {
@@ -460,17 +562,33 @@ func restoreFile(client *ftp.ServerConn, localPath string, rec Record) error {
 	}
 	defer resp.Close()
 
-	out, err := os.Create(localPath)
-	if err != nil {
-		return err
+	if rec.Encrypted && appConfig.EncryptionPassphrase != "" && appConfig.EncryptionSalt != "" {
+		key, err := deriveKey(appConfig.EncryptionPassphrase, appConfig.EncryptionSalt)
+		if err != nil {
+			return fmt.Errorf("key derivation failed: %w", err)
+		}
+		ciphertext, err := io.ReadAll(resp)
+		if err != nil {
+			return err
+		}
+		plaintext, err := decryptBytes(ciphertext, key)
+		if err != nil {
+			return fmt.Errorf("decryption failed: %w", err)
+		}
+		if err := os.WriteFile(localPath, plaintext, 0644); err != nil {
+			return err
+		}
+	} else {
+		out, err := os.Create(localPath)
+		if err != nil {
+			return err
+		}
+		defer out.Close()
+		if _, err := io.Copy(out, resp); err != nil {
+			return err
+		}
 	}
-	defer out.Close()
 
-	if _, err := io.Copy(out, resp); err != nil {
-		return err
-	}
-
-	// Remove the .frozen stub now that content is restored
 	os.Remove(localPath + ".frozen")
 	return nil
 }
@@ -515,7 +633,8 @@ func syncFolder(root string, client *ftp.ServerConn, state *State) error {
 			if err != nil {
 				return err
 			}
-			if err := uploadFile(client, path, remotePath); err != nil {
+			encrypted, err := uploadFile(client, path, remotePath)
+			if err != nil {
 				return err
 			}
 			if err := state.Put(path, Record{
@@ -527,6 +646,7 @@ func syncFolder(root string, client *ftp.ServerConn, state *State) error {
 				ContentHash:  contentHash,
 				LastModified: info.ModTime(),
 				FileSize:     info.Size(),
+				Encrypted:    encrypted,
 			}); err != nil {
 				return err
 			}
@@ -1693,15 +1813,54 @@ func runSettingsWindow() {
 		tickRow,
 	)
 
+	// Cryptography panel
+	encryptCheck := widget.NewCheck("Encrypt files before uploading to FTP", func(bool) {})
+	encryptCheck.SetChecked(appConfig.EncryptionEnabled)
+	passphraseEntry := widget.NewPasswordEntry()
+	passphraseEntry.SetPlaceHolder("Encryption passphrase")
+	passphraseEntry.SetText(appConfig.EncryptionPassphrase)
+	confirmEntry := widget.NewPasswordEntry()
+	confirmEntry.SetPlaceHolder("Confirm passphrase")
+	cryptoStatus := widget.NewLabel("")
+	if appConfig.EncryptionSalt != "" {
+		cryptoStatus.SetText("Encryption key configured.")
+	}
+	genSaltBtn := widget.NewButton("Generate new salt", func() {
+		salt, err := newEncryptionSalt()
+		if err != nil {
+			cryptoStatus.SetText("Failed to generate salt: " + err.Error())
+			return
+		}
+		appConfig.EncryptionSalt = salt
+		cryptoStatus.SetText("New salt generated. Save settings to apply. Warning: existing archived files will NOT be recoverable without the old key.")
+	})
+	genSaltBtn.Importance = widget.DangerImportance
+
+	cryptoPanel := container.NewVBox(
+		widget.NewLabelWithStyle("Cryptography", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel("When enabled, file content is encrypted with AES-256-GCM before upload."),
+		widget.NewLabel("The FTP server holds only ciphertext and cannot read your files."),
+		container.NewPadded(encryptCheck),
+		widget.NewLabel("Passphrase (combined with a random salt to derive your AES-256 key)"),
+		passphraseEntry,
+		confirmEntry,
+		container.NewPadded(cryptoStatus),
+		widget.NewSeparator(),
+		widget.NewLabel("Changing the salt invalidates all existing archived files."),
+		container.NewHBox(genSaltBtn),
+		widget.NewLabel("WARNING: if you lose your passphrase, encrypted archives cannot be recovered."),
+	)
+
 	sections := map[string]fyne.CanvasObject{
 		"Power":         powerPanel,
 		"Sync Schedule": schedulePanel,
 		"FTP & Folder":  ftpPanelFull,
 		"Exclusions":    exclusionsPanel,
 		"Storage":       storagePanel,
+		"Cryptography":  cryptoPanel,
 		"System":        systemPanel,
 	}
-	order := []string{"Power", "Sync Schedule", "FTP & Folder", "Exclusions", "Storage", "System"}
+	order := []string{"Power", "Sync Schedule", "FTP & Folder", "Exclusions", "Storage", "Cryptography", "System"}
 	selectedSection := "Power"
 	rightPanel := container.NewVBox(sections[selectedSection])
 
@@ -1748,6 +1907,30 @@ func runSettingsWindow() {
 			label := verifyHashCheck.Text
 			if i := strings.LastIndex(label, "("); i >= 0 {
 				cfg.HashCommand = strings.TrimSuffix(label[i+1:], ")")
+			}
+		}
+		// Cryptography
+		cfg.EncryptionEnabled = encryptCheck.Checked
+		if encryptCheck.Checked {
+			p := strings.TrimSpace(passphraseEntry.Text)
+			c := strings.TrimSpace(confirmEntry.Text)
+			if p == "" {
+				dialog.NewError(fmt.Errorf("passphrase cannot be empty when encryption is enabled"), w).Show()
+				return
+			}
+			if p != c {
+				dialog.NewError(fmt.Errorf("passphrases do not match"), w).Show()
+				return
+			}
+			cfg.EncryptionPassphrase = p
+			// Generate salt if not already set
+			if cfg.EncryptionSalt == "" {
+				salt, err := newEncryptionSalt()
+				if err != nil {
+					dialog.NewError(fmt.Errorf("failed to generate encryption salt: %v", err), w).Show()
+					return
+				}
+				cfg.EncryptionSalt = salt
 			}
 		}
 		var excluded []string

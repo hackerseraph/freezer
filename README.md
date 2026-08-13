@@ -145,29 +145,57 @@ To uninstall: delete the `HKCU\Software\Classes\.frozen` and `HKCU\Software\Clas
 ## Current Features
 
 ### Archive and Sync
-- Files in the configured root folder are uploaded to an FTP server and tracked with SHA-256 content hashes
-- Files older than 60 days are replaced with a `.frozen` stub file on disk; the content lives on FTP
-- Modified files are automatically re-uploaded and their expiry resets
-- Subfolders can be excluded from sync via the settings UI
+- Files in the configured root folder are uploaded to an FTP server and tracked with SHA-256 content hashes and file size
+- Configurable retention period (7 to 365 days) set via slider in Storage Settings; default is 60 days
+- Files past their retention date are replaced with a `.frozen` stub on disk; content remains on FTP
+- Modified files are automatically detected by modification time and re-uploaded; expiry clock resets
+- Subfolders can be excluded from sync via checkboxes in the Exclusions panel
+
+### File Integrity Verification
+- Before archiving a local file, Freezer optionally verifies the remote copy using:
+  - SIZE command: confirms the remote file size matches the locally recorded size (works on all FTP servers)
+  - Hash command: confirms content via HASH, XSHA256, XMD5, or XCRC if the server supports it
+- FTP server capabilities are discovered by clicking "Probe server capabilities" in FTP settings, which sends FEAT and auto-enables the best available verification method
+- An "allow unsafe freeze" option lets users archive even when no verification is available, with explicit acknowledgement of the risk
+- Files that fail verification are skipped and logged rather than silently archived
 
 ### Restore
 - All placeholders can be restored at once from the tray menu
 - Individual files can be restored by double-clicking the `.frozen` stub after running shell integration install
 - Shell integration registers `.frozen` files with the OS on both Windows and Linux
 
-### Settings UI
-- Local root folder browser (Thunar/Nautilus style with sidebar, breadcrumbs, back/forward navigation)
-- FTP server, username, password, and remote root configuration
-- Sync schedule by weekday
-- Power settings: sync on battery toggle, prevent sleep during sync
-- FTP throughput test with live progress indicator
-- Folder exclusion checkboxes auto-populated from the root folder
-- Shell integration installer
+### Settings Panels
+- Power: sync on battery toggle, prevent sleep during sync (systemd-inhibit on Linux, Windows API on Windows)
+- Sync Schedule: weekday selection for nightly scheduled sync
+- FTP and Folder: server, credentials, FTP root, local folder browser with sidebar/breadcrumbs/history, FTP throughput test with progress spinner, server capability probe and integrity verification options
+- Exclusions: checkboxes for each subfolder in the root folder, auto-populated when root changes
+- Storage: retention period slider (7 to 365 days) with labelled tick marks
+- System: install shell integration for double-click restore on Linux and Windows
 
 ### Platform
-- Runs on Windows and Linux
+- Runs on Windows 10/11 and Linux (Debian, Ubuntu, Mint, and compatible distributions)
 - System tray icon with sync now, restore, open folder, and quit options
-- Cross-platform sleep prevention during sync (systemd-inhibit on Linux, Windows API on Windows)
+- Startup log written to the OS cache directory for diagnosing silent crashes
+
+## Screenshots
+
+### Power
+![Power settings](screenshots/settings-power.png)
+
+### Sync Schedule
+![Sync Schedule settings](screenshots/settings-sync-schedule.png)
+
+### FTP & Folder
+![FTP and Folder settings](screenshots/settings-ftp-folder.png)
+
+### Exclusions
+![Exclusions settings](screenshots/settings-exclusions.png)
+
+### Storage
+![Storage settings](screenshots/settings-storage.png)
+
+### System Integration
+![System Integration settings](screenshots/settings-system.png)
 
 ## Planned Features
 

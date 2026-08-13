@@ -65,6 +65,7 @@ type Config struct {
 	VerifyUploadSize       bool
 	VerifyUploadHash       bool
 	HashCommand            string
+	AllowUnsafeFreeze      bool
 	Weekdays               [7]bool
 	SyncHour               int
 	SyncMinute             int
@@ -111,6 +112,7 @@ func defaultConfig() Config {
 		VerifyUploadSize:       true,
 		VerifyUploadHash:       false,
 		HashCommand:            "",
+		AllowUnsafeFreeze:      false,
 		Weekdays:               [7]bool{},
 		SyncHour:               23,
 		SyncMinute:             0,
@@ -451,6 +453,13 @@ func pruneExpired(client *ftp.ServerConn, state *State) error {
 			continue
 		}
 		if record.IsExpired(now) {
+			// If neither size nor hash verification is enabled, only proceed if the
+			// user has explicitly opted in to unsafe freezing
+			noVerification := !appConfig.VerifyUploadSize && !appConfig.VerifyUploadHash
+			if noVerification && !appConfig.AllowUnsafeFreeze {
+				log.Printf("skip prune for %s: no integrity checks enabled and allow-unsafe-freeze is off", localPath)
+				continue
+			}
 			remoteSize, err := client.FileSize(record.RemotePath)
 			if err != nil {
 				log.Printf("skip prune for %s: remote file missing - %v", localPath, err)
@@ -1407,11 +1416,13 @@ func runSettingsWindow() {
 	)
 
 	capStatusLabel := widget.NewLabel("")
-	verifySizeCheck := widget.NewCheck("Verify file size before archiving (SIZE)", func(bool) {})
+	verifySizeCheck := widget.NewCheck("Verify file size before archiving — SIZE (lowest level, confirms existence and completeness only)", func(bool) {})
 	verifySizeCheck.SetChecked(appConfig.VerifyUploadSize)
 	verifyHashCheck := widget.NewCheck("Verify file hash before archiving", func(bool) {})
 	verifyHashCheck.SetChecked(appConfig.VerifyUploadHash)
 	verifyHashCheck.Disable() // enabled only if a hash command is detected
+	allowUnsafeCheck := widget.NewCheck("Allow freezing even when no integrity verification is available (at your own risk)", func(bool) {})
+	allowUnsafeCheck.SetChecked(appConfig.AllowUnsafeFreeze)
 
 	probeBtn := widget.NewButton("Probe server capabilities", nil)
 	probeBtn.OnTapped = func() {
@@ -1453,6 +1464,7 @@ func runSettingsWindow() {
 		container.NewPadded(capStatusLabel),
 		container.NewPadded(verifySizeCheck),
 		container.NewPadded(verifyHashCheck),
+		container.NewPadded(allowUnsafeCheck),
 	)
 
 	ftpPanelFull := container.NewVBox(
@@ -1610,6 +1622,7 @@ func runSettingsWindow() {
 		cfg.RetentionDays = retentionDays
 		cfg.VerifyUploadSize = verifySizeCheck.Checked
 		cfg.VerifyUploadHash = verifyHashCheck.Checked
+		cfg.AllowUnsafeFreeze = allowUnsafeCheck.Checked
 		if verifyHashCheck.Checked {
 			// Extract command name from checkbox label e.g. "...(XMD5)"
 			label := verifyHashCheck.Text

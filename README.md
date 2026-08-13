@@ -385,13 +385,12 @@ To uninstall: delete the `HKCU\Software\Classes\.frozen` and `HKCU\Software\Clas
 ### File Integrity
 - Content hashing upgrade: migrate from SHA-256 to MD5+SHA-256 dual hashing for faster change detection on large files while retaining collision resistance for archival verification
 - File fingerprinting: maintain an inode/fingerprint index alongside the archive state so renamed or moved files are recognised as the same file rather than re-uploaded as new
-- Magic byte verification on restore: before writing a restored file to disk, read its magic bytes and compare against the expected file type recorded at upload time; reject files whose content type has changed unexpectedly, which could indicate corruption or a tampered remote file
 
 ### Compression
 - Pre-upload compression: compress file content before encrypting and uploading to reduce FTP storage usage and transfer time; candidates are zstd (fast, high ratio) and gzip (universal compatibility)
-- Adaptive compression: skip compression for file types that are already compressed (JPEG, MP4, ZIP, etc.) by checking magic bytes and known extensions, avoiding wasted CPU for zero-gain transfers
+- Magic byte detection: read the first bytes of each file before compressing and compare against a table of known compressed format signatures (JPEG, PNG, MP4, ZIP, GZ, ZSTD, etc.); skip compression automatically for files that are already compressed to avoid wasted CPU and potentially larger output
 - Compression level setting: expose a slider in Storage Settings to let users trade transfer speed against storage savings
-- Compressed file format: the Freezer file envelope (currently FRZR magic + nonce + ciphertext) will be extended to indicate whether the payload is compressed, so the correct decompression is applied on restore regardless of when the file was archived
+- Compressed file format: extend the Freezer file envelope (FRZR magic header) with a compression flag so the correct decompression is applied on restore regardless of when the file was archived
 
 ### Multi-User and Access Control
 - File locking: advisory locks to prevent simultaneous archive/restore conflicts when multiple users or machines share the same FTP root

@@ -500,6 +500,11 @@ func uploadFile(client *ftp.ServerConn, localPath, remotePath string) (bool, err
 		return true, nil
 	}
 
+	// Refuse to upload plaintext if the user has encryption enabled but hasn't unlocked
+	if appConfig.EncryptionEnabled && activeEncryptionKey == nil {
+		return false, fmt.Errorf("encryption is enabled but not unlocked — use 'Unlock encryption...' from the tray menu before syncing")
+	}
+
 	return false, client.Stor(remotePath, f)
 }
 

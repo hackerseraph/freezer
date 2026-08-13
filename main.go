@@ -74,8 +74,7 @@ type Config struct {
 	AllowUnsafeFreeze      bool
 	LastIndexBackup        time.Time
 	EncryptionEnabled      bool
-	EncryptionPassphrase   string
-	EncryptionSalt         string // base64-encoded 32-byte random salt
+	EncryptionSalt         string // base64-encoded 32-byte random salt; passphrase is NEVER stored on disk
 	Weekdays               [7]bool
 	SyncHour               int
 	SyncMinute             int
@@ -350,6 +349,10 @@ func loadConfig() Config {
 // encryptionMagic is the 4-byte header identifying an encrypted Freezer file.
 var encryptionMagic = []byte("FRZR")
 
+// activeEncryptionKey holds the in-memory derived key for the current session.
+// It is NEVER written to disk. Nil means encryption is locked / passphrase not entered.
+var activeEncryptionKey []byte
+
 // deriveKey runs Argon2id on the passphrase and salt to produce a 32-byte AES key.
 func deriveKey(passphrase, saltB64 string) ([]byte, error) {
 	salt, err := base64.StdEncoding.DecodeString(saltB64)
@@ -486,12 +489,8 @@ func uploadFile(client *ftp.ServerConn, localPath, remotePath string) (bool, err
 		}
 	}
 
-	if appConfig.EncryptionEnabled && appConfig.EncryptionPassphrase != "" && appConfig.EncryptionSalt != "" {
-		key, err := deriveKey(appConfig.EncryptionPassphrase, appConfig.EncryptionSalt)
-		if err != nil {
-			return false, fmt.Errorf("key derivation failed: %w", err)
-		}
-		ciphertext, err := encryptStream(f, key)
+	if appConfig.EncryptionEnabled && activeEncryptionKey != nil {
+		ciphertext, err := encryptStream(f, activeEncryptionKey)
 		if err != nil {
 			return false, fmt.Errorf("encryption failed: %w", err)
 		}
@@ -562,22 +561,20 @@ func restoreFile(client *ftp.ServerConn, localPath string, rec Record) error {
 	}
 	defer resp.Close()
 
-	if rec.Encrypted && appConfig.EncryptionPassphrase != "" && appConfig.EncryptionSalt != "" {
-		key, err := deriveKey(appConfig.EncryptionPassphrase, appConfig.EncryptionSalt)
-		if err != nil {
-			return fmt.Errorf("key derivation failed: %w", err)
-		}
+	if rec.Encrypted && activeEncryptionKey != nil {
 		ciphertext, err := io.ReadAll(resp)
 		if err != nil {
 			return err
 		}
-		plaintext, err := decryptBytes(ciphertext, key)
+		plaintext, err := decryptBytes(ciphertext, activeEncryptionKey)
 		if err != nil {
 			return fmt.Errorf("decryption failed: %w", err)
 		}
 		if err := os.WriteFile(localPath, plaintext, 0644); err != nil {
 			return err
 		}
+	} else if rec.Encrypted && activeEncryptionKey == nil {
+		return fmt.Errorf("file %s is encrypted but encryption is locked; use 'Unlock encryption' from the tray menu", localPath)
 	} else {
 		out, err := os.Create(localPath)
 		if err != nil {
@@ -1816,39 +1813,74 @@ func runSettingsWindow() {
 	// Cryptography panel
 	encryptCheck := widget.NewCheck("Encrypt files before uploading to FTP", func(bool) {})
 	encryptCheck.SetChecked(appConfig.EncryptionEnabled)
+
+	alreadyConfigured := appConfig.EncryptionSalt != ""
+
 	passphraseEntry := widget.NewPasswordEntry()
-	passphraseEntry.SetPlaceHolder("Encryption passphrase")
-	passphraseEntry.SetText(appConfig.EncryptionPassphrase)
 	confirmEntry := widget.NewPasswordEntry()
-	confirmEntry.SetPlaceHolder("Confirm passphrase")
+
 	cryptoStatus := widget.NewLabel("")
-	if appConfig.EncryptionSalt != "" {
-		cryptoStatus.SetText("Encryption key configured.")
+	var passphraseLabel, confirmLabel *widget.Label
+
+	if alreadyConfigured {
+		passphraseEntry.SetPlaceHolder("Enter passphrase to unlock or change")
+		confirmEntry.Hide()
+		cryptoStatus.SetText("Encryption configured. Passphrase is not stored on disk.")
+		passphraseLabel = widget.NewLabel("Enter passphrase to unlock for this session:")
+		confirmLabel = widget.NewLabel("")
+	} else {
+		passphraseEntry.SetPlaceHolder("New passphrase")
+		confirmEntry.SetPlaceHolder("Confirm passphrase")
+		cryptoStatus.SetText("Passphrase is never stored on disk. You will be prompted on startup.")
+		passphraseLabel = widget.NewLabel("Passphrase (Argon2id-derived AES-256 key, never stored on disk):")
+		confirmLabel = widget.NewLabel("Confirm passphrase:")
 	}
-	genSaltBtn := widget.NewButton("Generate new salt", func() {
+
+	unlockBtn := widget.NewButton("Unlock for this session", func() {
+		p := strings.TrimSpace(passphraseEntry.Text)
+		if p == "" {
+			cryptoStatus.SetText("Passphrase cannot be empty.")
+			return
+		}
+		key, err := deriveKey(p, appConfig.EncryptionSalt)
+		if err != nil {
+			cryptoStatus.SetText("Key derivation failed: " + err.Error())
+			return
+		}
+		activeEncryptionKey = key
+		cryptoStatus.SetText("Encryption unlocked for this session.")
+		passphraseEntry.SetText("")
+	})
+	if !alreadyConfigured {
+		unlockBtn.Hide()
+	}
+
+	genSaltBtn := widget.NewButton("Re-generate salt (invalidates existing archive)", func() {
 		salt, err := newEncryptionSalt()
 		if err != nil {
 			cryptoStatus.SetText("Failed to generate salt: " + err.Error())
 			return
 		}
 		appConfig.EncryptionSalt = salt
-		cryptoStatus.SetText("New salt generated. Save settings to apply. Warning: existing archived files will NOT be recoverable without the old key.")
+		activeEncryptionKey = nil
+		cryptoStatus.SetText("New salt generated. Save and re-enter passphrase. All existing encrypted archives are no longer recoverable.")
 	})
 	genSaltBtn.Importance = widget.DangerImportance
 
 	cryptoPanel := container.NewVBox(
 		widget.NewLabelWithStyle("Cryptography", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		widget.NewLabel("When enabled, file content is encrypted with AES-256-GCM before upload."),
-		widget.NewLabel("The FTP server holds only ciphertext and cannot read your files."),
+		widget.NewLabel("The FTP server holds only ciphertext. Passphrase is never written to disk."),
 		container.NewPadded(encryptCheck),
-		widget.NewLabel("Passphrase (combined with a random salt to derive your AES-256 key)"),
+		passphraseLabel,
 		passphraseEntry,
+		confirmLabel,
 		confirmEntry,
+		container.NewHBox(unlockBtn),
 		container.NewPadded(cryptoStatus),
 		widget.NewSeparator(),
-		widget.NewLabel("Changing the salt invalidates all existing archived files."),
-		container.NewHBox(genSaltBtn),
 		widget.NewLabel("WARNING: if you lose your passphrase, encrypted archives cannot be recovered."),
+		container.NewHBox(genSaltBtn),
 	)
 
 	sections := map[string]fyne.CanvasObject{
@@ -1909,9 +1941,10 @@ func runSettingsWindow() {
 				cfg.HashCommand = strings.TrimSuffix(label[i+1:], ")")
 			}
 		}
-		// Cryptography
+		// Cryptography — passphrase is NEVER saved to disk
 		cfg.EncryptionEnabled = encryptCheck.Checked
-		if encryptCheck.Checked {
+		if encryptCheck.Checked && !alreadyConfigured {
+			// First-time setup: validate passphrase, generate salt, derive key into memory
 			p := strings.TrimSpace(passphraseEntry.Text)
 			c := strings.TrimSpace(confirmEntry.Text)
 			if p == "" {
@@ -1922,16 +1955,21 @@ func runSettingsWindow() {
 				dialog.NewError(fmt.Errorf("passphrases do not match"), w).Show()
 				return
 			}
-			cfg.EncryptionPassphrase = p
-			// Generate salt if not already set
-			if cfg.EncryptionSalt == "" {
-				salt, err := newEncryptionSalt()
-				if err != nil {
-					dialog.NewError(fmt.Errorf("failed to generate encryption salt: %v", err), w).Show()
-					return
-				}
-				cfg.EncryptionSalt = salt
+			salt, err := newEncryptionSalt()
+			if err != nil {
+				dialog.NewError(fmt.Errorf("failed to generate encryption salt: %v", err), w).Show()
+				return
 			}
+			cfg.EncryptionSalt = salt
+			key, err := deriveKey(p, salt)
+			if err != nil {
+				dialog.NewError(fmt.Errorf("key derivation failed: %v", err), w).Show()
+				return
+			}
+			activeEncryptionKey = key
+		} else {
+			// Preserve existing salt
+			cfg.EncryptionSalt = appConfig.EncryptionSalt
 		}
 		var excluded []string
 		for _, chk := range excludeCheckboxes {
@@ -2095,6 +2133,50 @@ func measureFTPThroughput(host, user, pass, ftpRoot string) (uploadMbps float64,
 	return uploadMbps, downloadMbps, nil
 }
 
+// launchPassphrasePrompt opens a small Fyne window asking for the encryption passphrase.
+// The derived key is stored in memory only for the current session.
+func launchPassphrasePrompt() {
+	a := app.NewWithID("com.freezer.unlock")
+	a.Settings().SetTheme(compactTheme{Theme: theme.DefaultTheme()})
+	w := a.NewWindow("Unlock Encryption")
+	w.Resize(fyne.NewSize(400, 180))
+	w.SetFixedSize(true)
+	w.SetCloseIntercept(func() { w.Close(); a.Quit() })
+
+	entry := widget.NewPasswordEntry()
+	entry.SetPlaceHolder("Enter passphrase")
+	status := widget.NewLabel("")
+
+	okBtn := widget.NewButton("Unlock", func() {
+		p := strings.TrimSpace(entry.Text)
+		if p == "" {
+			status.SetText("Passphrase cannot be empty.")
+			return
+		}
+		key, err := deriveKey(p, appConfig.EncryptionSalt)
+		if err != nil {
+			status.SetText("Error: " + err.Error())
+			return
+		}
+		activeEncryptionKey = key
+		log.Printf("Encryption unlocked for this session")
+		w.Close()
+		a.Quit()
+	})
+	okBtn.Importance = widget.HighImportance
+
+	cancelBtn := widget.NewButton("Cancel", func() { w.Close(); a.Quit() })
+
+	w.SetContent(container.NewVBox(
+		widget.NewLabel("Enter your encryption passphrase to enable encrypted sync for this session."),
+		entry,
+		status,
+		container.NewHBox(layout.NewSpacer(), okBtn, cancelBtn),
+	))
+	w.Show()
+	a.Run()
+}
+
 func onReady() {
 	setTrayIcon()
 	systray.SetTitle("❄️")
@@ -2110,6 +2192,10 @@ func onReady() {
 	sleepStatusItem.Disable()
 	systray.AddSeparator()
 	settingsItem := systray.AddMenuItem("Settings...", "Edit FTP and local folder configuration")
+	unlockItem := systray.AddMenuItem("Unlock encryption...", "Enter passphrase to unlock encrypted sync for this session")
+	if !appConfig.EncryptionEnabled {
+		unlockItem.Hide()
+	}
 	syncItem := systray.AddMenuItem("Sync now", "Run an immediate sync")
 	restoreItem := systray.AddMenuItem("Restore placeholders", "Download archived files back to disk")
 	openFolderItem := systray.AddMenuItem("Open archive folder", "Open the local cold-storage folder")
@@ -2121,6 +2207,8 @@ func onReady() {
 			select {
 			case <-settingsItem.ClickedCh:
 				go openSettingsWindow()
+			case <-unlockItem.ClickedCh:
+				go launchPassphrasePrompt()
 			case <-syncItem.ClickedCh:
 				refreshConfig()
 				if !shouldSyncNow() {

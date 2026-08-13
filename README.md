@@ -1,6 +1,36 @@
 # freezer
 A small Go project for using external storage as cold storage. Centered around laptops and environments with fast but small local storage, this lets you automatically move uncommon files to cold storage, to keep a constant churn of free space on your local devices.
 
+## Contents
+
+- [Installation](#installation)
+  - [Debian / Ubuntu / Linux Mint](#debian--ubuntu--linux-mint)
+  - [Windows 10 / 11](#windows-10--11)
+- [Run](#run)
+- [Test](#test)
+- [How Record Keeping Works](#how-record-keeping-works)
+  - [The Record Structure](#the-record-structure)
+  - [How Sync Uses the Record](#how-sync-uses-the-record)
+  - [File Integrity and FTP Limitations](#file-integrity-and-ftp-limitations)
+- [Understanding Shell Integration](#understanding-shell-integration)
+  - [Ubuntu / Linux Mint / Debian](#ubuntu--linux-mint--debian)
+  - [Windows 10 / 11](#windows-10--11-1)
+- [Current Features](#current-features)
+  - [Archive and Sync](#archive-and-sync)
+  - [File Integrity Verification](#file-integrity-verification)
+  - [Restore](#restore)
+  - [Settings Panels](#settings-panels)
+  - [Platform](#platform)
+- [Screenshots](#screenshots)
+- [Planned Features](#planned-features)
+  - [File Integrity](#file-integrity)
+  - [Multi-User and Access Control](#multi-user-and-access-control)
+  - [Security](#security)
+  - [Storage Backends](#storage-backends)
+  - [Migration and Uninstall](#migration-and-uninstall)
+  - [Scheduling](#scheduling)
+  - [Uninstall and Data Recovery](#uninstall-and-data-recovery)
+
 ## Installation
 
 ### Debian / Ubuntu / Linux Mint

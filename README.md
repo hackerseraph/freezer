@@ -66,6 +66,46 @@ go run .
 ## Test
 go test ./...
 
+## Understanding Shell Integration
+
+Freezer replaces archived files with `.frozen` stub files so you can see what has been moved to cold storage without losing the file name or folder structure. Shell integration teaches the operating system to open those stubs with Freezer when you double-click them, triggering an automatic restore from your FTP server.
+
+### Ubuntu / Linux Mint / Debian
+
+Clicking "Install shell integration" in Settings > System does the following, all within your home directory with no root access required:
+
+Writes a MIME type definition to `~/.local/share/mime/packages/freezer.xml` that tells the OS `.frozen` files belong to the type `application/x-freezer-placeholder`. Runs `update-mime-database` to register it.
+
+Writes a desktop handler to `~/.local/share/applications/freezer-restore.desktop` that tells any XDG-compliant file manager (Thunar, Nautilus, Nemo, Dolphin) to run `freezer -restore %f` when a file of that type is opened. Runs `update-desktop-database` to register it.
+
+Calls `xdg-mime default freezer-restore.desktop application/x-freezer-placeholder` to set Freezer as the default handler for that MIME type.
+
+The result is that double-clicking a `.frozen` file in any supported file manager runs `freezer -restore /full/path/to/file.ext.frozen`, which connects to FTP, downloads the original content, and replaces the stub with the real file.
+
+To uninstall: delete `~/.local/share/mime/packages/freezer.xml` and `~/.local/share/applications/freezer-restore.desktop`, then run `update-mime-database ~/.local/share/mime` and `update-desktop-database ~/.local/share/applications`.
+
+### Windows 10 / 11
+
+Clicking "Install shell integration" in Settings > System writes four registry keys under `HKEY_CURRENT_USER` using `reg add`. Because it targets the current user hive rather than `HKLM`, no UAC prompt or administrator rights are required.
+
+```
+HKCU\Software\Classes\.frozen
+  (Default) = FreezerPlaceholder
+
+HKCU\Software\Classes\FreezerPlaceholder
+  (Default) = Freezer Archive File
+
+HKCU\Software\Classes\FreezerPlaceholder\DefaultIcon
+  (Default) = C:\path\to\freezer.exe,0
+
+HKCU\Software\Classes\FreezerPlaceholder\shell\open\command
+  (Default) = "C:\path\to\freezer.exe" -restore "%1"
+```
+
+The path to `freezer.exe` is resolved at runtime so it points to wherever the binary actually lives. The result is that double-clicking any `.frozen` file in Windows Explorer runs `freezer.exe -restore "C:\path\to\file.ext.frozen"`, which connects to FTP, downloads the original content, and replaces the stub with the real file.
+
+To uninstall: delete the `HKCU\Software\Classes\.frozen` and `HKCU\Software\Classes\FreezerPlaceholder` keys from the registry.
+
 ## Current Features
 
 ### Archive and Sync

@@ -33,8 +33,17 @@ import (
 	"github.com/jlaffaye/ftp"
 )
 
-const retentionDays = 60
+const defaultRetentionDays = 60
 const metadataDirName = ".coldstorage"
+
+// retentionDays returns the configured retention period, falling back to the default.
+func retentionDuration() time.Duration {
+	days := appConfig.RetentionDays
+	if days <= 0 {
+		days = defaultRetentionDays
+	}
+	return time.Duration(days) * 24 * time.Hour
+}
 
 var appConfig Config
 var settingsMode bool
@@ -50,6 +59,7 @@ type Config struct {
 	SyncOnBattery          bool
 	PreventSleepDuringSync bool
 	ExcludedFolders        []string
+	RetentionDays          int
 	Weekdays               [7]bool
 	SyncHour               int
 	SyncMinute             int
@@ -91,6 +101,7 @@ func defaultConfig() Config {
 		SyncOnBattery:          false,
 		PreventSleepDuringSync: false,
 		ExcludedFolders:        []string{},
+		RetentionDays:          defaultRetentionDays,
 		Weekdays:               [7]bool{},
 		SyncHour:               23,
 		SyncMinute:             0,
@@ -325,7 +336,7 @@ func createPlaceholder(path string, rec Record) error {
 		return err
 	}
 	defer f.Close()
-	archivedDate := rec.ExpiresAt.Add(-retentionDays * 24 * time.Hour).Format("2006-01-02")
+	archivedDate := rec.ExpiresAt.Add(-retentionDuration()).Format("2006-01-02")
 	_, err = fmt.Fprintf(f,
 		"[Freezer Archive]\nThis file has been moved to cold storage.\nOriginal: %s\nArchived: %s\nRemote: %s\n\nDouble-click this file to restore it, or use the Freezer tray menu.\n",
 		filepath.Base(path), archivedDate, rec.RemotePath,
@@ -413,7 +424,7 @@ func syncFolder(root string, client *ftp.ServerConn, state *State) error {
 				LocalPath:    path,
 				RemotePath:   remotePath,
 				UploadedAt:   now,
-				ExpiresAt:    now.Add(retentionDays * 24 * time.Hour),
+				ExpiresAt:    now.Add(retentionDuration()),
 				Placeholder:  false,
 				ContentHash:  contentHash,
 				LastModified: info.ModTime(),
@@ -458,7 +469,7 @@ func restorePlaceholderIfNeeded(path string, client *ftp.ServerConn, state *Stat
 	}
 	record.Placeholder = false
 	record.UploadedAt = time.Now()
-	record.ExpiresAt = time.Now().Add(retentionDays * 24 * time.Hour)
+	record.ExpiresAt = time.Now().Add(retentionDuration())
 	state.Records[path] = record
 	return nil
 }
@@ -491,7 +502,7 @@ func restoreSingleFile(frozenPath string) error {
 
 	record.Placeholder = false
 	record.UploadedAt = time.Now()
-	record.ExpiresAt = time.Now().Add(retentionDays * 24 * time.Hour)
+	record.ExpiresAt = time.Now().Add(retentionDuration())
 	state.Records[originalPath] = record
 	return state.Save(metadataPath)
 }
@@ -657,7 +668,7 @@ func restorePlaceholderFiles(root, host, user, pass string) error {
 		}
 		record.Placeholder = false
 		record.UploadedAt = time.Now()
-		record.ExpiresAt = time.Now().Add(retentionDays * 24 * time.Hour)
+		record.ExpiresAt = time.Now().Add(retentionDuration())
 		state.Records[localPath] = record
 	}
 
@@ -1293,7 +1304,7 @@ func runSettingsWindow() {
 		if err := installShellIntegration(); err != nil {
 			shellIntegrationStatus.SetText("Failed: " + err.Error())
 		} else {
-			shellIntegrationStatus.SetText("✓ Installed! Double-click any .frozen file to restore it.")
+			shellIntegrationStatus.SetText("Installed! Double-click any .frozen file to restore it.")
 		}
 	})
 	systemPanel := container.NewVBox(
@@ -1303,14 +1314,47 @@ func runSettingsWindow() {
 		container.NewPadded(shellIntegrationStatus),
 	)
 
+	// Storage Settings panel - retention slider
+	retentionDays := appConfig.RetentionDays
+	if retentionDays <= 0 {
+		retentionDays = defaultRetentionDays
+	}
+	retentionLabel := widget.NewLabel(fmt.Sprintf("Keep files warm for %d days before freezing", retentionDays))
+	retentionSlider := widget.NewSlider(7, 365)
+	retentionSlider.Step = 1
+	retentionSlider.Value = float64(retentionDays)
+	retentionSlider.OnChanged = func(v float64) {
+		retentionDays = int(v)
+		retentionLabel.SetText(fmt.Sprintf("Keep files warm for %d days before freezing", retentionDays))
+	}
+
+	// Tick label row showing key intervals
+	tickRow := container.NewGridWithColumns(6,
+		widget.NewLabelWithStyle("7d", fyne.TextAlignLeading, fyne.TextStyle{}),
+		widget.NewLabelWithStyle("30d", fyne.TextAlignCenter, fyne.TextStyle{}),
+		widget.NewLabelWithStyle("60d", fyne.TextAlignCenter, fyne.TextStyle{}),
+		widget.NewLabelWithStyle("90d", fyne.TextAlignCenter, fyne.TextStyle{}),
+		widget.NewLabelWithStyle("180d", fyne.TextAlignCenter, fyne.TextStyle{}),
+		widget.NewLabelWithStyle("365d", fyne.TextAlignTrailing, fyne.TextStyle{}),
+	)
+
+	storagePanel := container.NewVBox(
+		widget.NewLabelWithStyle("Storage Settings", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel("Configure how long files stay on local disk before being archived to cold storage."),
+		container.NewPadded(retentionLabel),
+		retentionSlider,
+		tickRow,
+	)
+
 	sections := map[string]fyne.CanvasObject{
 		"Power":         powerPanel,
 		"Sync Schedule": schedulePanel,
 		"FTP & Folder":  ftpPanel,
 		"Exclusions":    exclusionsPanel,
+		"Storage":       storagePanel,
 		"System":        systemPanel,
 	}
-	order := []string{"Power", "Sync Schedule", "FTP & Folder", "Exclusions", "System"}
+	order := []string{"Power", "Sync Schedule", "FTP & Folder", "Exclusions", "Storage", "System"}
 	selectedSection := "Power"
 	rightPanel := container.NewVBox(sections[selectedSection])
 
@@ -1348,6 +1392,7 @@ func runSettingsWindow() {
 		cfg.FTPRoot = strings.TrimSpace(ftpRootEntry.Text)
 		cfg.SyncOnBattery = batteryCheck.Checked
 		cfg.PreventSleepDuringSync = preventSleepCheck.Checked
+		cfg.RetentionDays = retentionDays
 		var excluded []string
 		for _, chk := range excludeCheckboxes {
 			if chk.Checked {

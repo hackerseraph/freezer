@@ -28,7 +28,7 @@ func TestPlaceholderHandling(t *testing.T) {
 	rec := Record{
 		LocalPath:  path,
 		RemotePath: "/remote/example.txt",
-		ExpiresAt:  time.Now().Add(retentionDays * 24 * time.Hour),
+		ExpiresAt:  time.Now().Add(retentionDuration()),
 	}
 	if err := archiveLocalFile(path, rec); err != nil {
 		t.Fatal(err)
